@@ -1,0 +1,874 @@
+"""Extracción multipaso de entidades y relaciones con sliding context."""
+
+import logging
+
+from pydantic import BaseModel, Field
+from tqdm import tqdm
+
+from ..config import get_settings
+from ..llm.embedding_client import EmbeddingClient
+from ..llm.gemini_client import GeminiClient, ModelTier
+from ..utils.embeddings import cosine_similarity
+
+logger = logging.getLogger(__name__)
+
+
+# Modelos de entidades (coinciden con los nodos)
+
+class CharacterEntity(BaseModel):
+    """Un personaje mencionado en el fragmento."""
+
+    name: str = Field(..., description="Nombre del personaje exactamente como aparece en el texto")
+    # No rellenar — se reconstruye automáticamente en entity resolution.
+    aliases: list[str] = Field(
+        default_factory=list,
+        description="Leave empty. Do not populate. Auto-generated during entity resolution.",
+    )
+    occupation: str = Field(default="", description="Ocupación o rol")
+    description: str = Field(
+        default="", description="Descripción breve del personaje en este contexto"
+    )
+
+
+class LocationEntity(BaseModel):
+    """Un lugar mencionado en el fragmento."""
+
+    name: str = Field(..., description="Nombre del lugar")
+    type: str = Field(
+        default="unknown",
+        description="Tipo: city/building/street/region/country",
+    )
+    description: str = Field(default="", description="Descripción del lugar")
+
+
+class CrimeEntity(BaseModel):
+    """Un crimen o misterio central del relato."""
+
+    type: str = Field(
+        ...,
+        description="Tipo: murder/theft/blackmail/fraud/disappearance/assault/other",
+    )
+    description: str = Field(default="", description="Descripción del crimen")
+    motive: str = Field(default="", description="Motivo si se conoce")
+
+
+class ObjectEntity(BaseModel):
+    """Un objeto significativo para la trama."""
+
+    name: str = Field(..., description="Nombre del objeto")
+    type: str = Field(
+        default="other",
+        description="Tipo: weapon/document/jewel/animal/clothing/other",
+    )
+    description: str = Field(default="", description="Descripción y relevancia")
+
+
+class DeductionEntity(BaseModel):
+    """Una cadena de razonamiento deductivo de Holmes."""
+
+    observation: str = Field(..., description="Lo que Holmes observa")
+    inference: str = Field(default="", description="El razonamiento que hace")
+    conclusion: str = Field(default="", description="La conclusión a la que llega")
+    method: str = Field(
+        default="logical",
+        description="Método: physical_evidence/behavioral/forensic/logical",
+    )
+
+
+class SceneEntity(BaseModel):
+    """Una unidad narrativa (escena) del relato."""
+
+    title: str = Field(..., description="Título descriptivo breve de la escena")
+    description: str = Field(default="", description="Qué ocurre en la escena")
+    sequence_order: int = Field(
+        default=0, description="Orden en la secuencia narrativa"
+    )
+
+
+class EventEntity(BaseModel):
+    """Un evento clave de la trama."""
+
+    name: str = Field(..., description="Nombre del evento")
+    description: str = Field(default="", description="Descripción del evento")
+
+
+
+# Modelos de relaciones
+
+class ExtractedRelationship(BaseModel):
+    """Una relación extraída entre dos entidades del grafo."""
+
+    source_name: str = Field(..., description="Nombre de la entidad origen")
+    source_type: str = Field(
+        ..., description="Tipo de la entidad origen (Character, Location, etc.)"
+    )
+    target_name: str = Field(..., description="Nombre de la entidad destino")
+    target_type: str = Field(..., description="Tipo de la entidad destino")
+    relationship_type: str = Field(
+        ...,
+        description="Tipo de relación (APPEARS_IN, KNOWS, INVESTIGATES, LOCATED_IN, etc.)",
+    )
+    properties: dict = Field(
+        default_factory=dict,
+        description="Propiedades de la relación (role, relationship_type, etc.)",
+    )
+
+
+
+# Contenedores para structured output
+
+class EntityExtractionResult(BaseModel):
+    """Resultado completo de la extracción de entidades de un chunk."""
+
+    characters: list[CharacterEntity] = Field(default_factory=list)
+    locations: list[LocationEntity] = Field(default_factory=list)
+    crimes: list[CrimeEntity] = Field(default_factory=list)
+    objects: list[ObjectEntity] = Field(default_factory=list)
+    deductions: list[DeductionEntity] = Field(default_factory=list)
+    scenes: list[SceneEntity] = Field(default_factory=list)
+    events: list[EventEntity] = Field(default_factory=list)
+
+
+class RelationshipExtractionResult(BaseModel):
+    """Resultado de la extracción de relaciones entre entidades."""
+
+    relationships: list[ExtractedRelationship] = Field(default_factory=list)
+
+
+
+# Contexto narrativo acumulativo (sliding context)
+
+class NarrativeContext(BaseModel):
+    """Estado narrativo acumulado del relato a lo largo del sliding context."""
+
+    current_location: str = Field(
+        default="", description="Dónde se encuentran los personajes ahora"
+    )
+    characters_present: list[str] = Field(
+        default_factory=list,
+        description="Personajes actualmente en escena",
+    )
+    recent_events: list[str] = Field(
+        default_factory=list,
+        description="Últimos 3-5 eventos relevantes",
+    )
+    active_investigation: str = Field(
+        default="", description="Caso o crimen que se está investigando"
+    )
+    unresolved_references: list[str] = Field(
+        default_factory=list,
+        description="Referencias sin resolver (pronombres, alias ambiguos)",
+    )
+    summary: str = Field(
+        default="",
+        description="Resumen narrativo de 2-3 frases del contexto hasta este punto",
+    )
+
+
+
+# Funciones auxiliares a nivel de módulo
+
+
+def _normalize_name(name: str) -> str:
+    """Normaliza un nombre para comparación: lowercase y espacios simples."""
+    return " ".join(name.lower().strip().split())
+
+
+# Títulos y honoríficos que no forman parte del nombre propio
+_TITLE_PREFIXES: frozenset[str] = frozenset({
+    "mr", "mrs", "ms", "miss", "dr", "colonel", "col", "major", "captain",
+    "capt", "inspector", "professor", "prof", "sir", "lady", "lord",
+    "young", "old", "the", "a", "an", "née", "esq",
+})
+
+
+def _strip_titles(name: str) -> str:
+    """Elimina títulos y honoríficos de un nombre para comparación.
+
+    Ejemplos:
+        'Mr. Sherlock Holmes'  → 'sherlock holmes'
+        'Colonel James Moriarty' → 'james moriarty'
+        'Dr. Watson'           → 'watson'
+
+    Si tras el strip no queda nada (p. ej. 'the colonel'), devuelve
+    el nombre normalizado original para no perder la referencia.
+    """
+    tokens = _normalize_name(name).replace(",", "").replace(".", "").split()
+    core = [t for t in tokens if t not in _TITLE_PREFIXES]
+    return " ".join(core) if core else _normalize_name(name)
+
+
+def _is_bare_name(original: str, stripped: str) -> bool:
+    """Devuelve True si el nombre original no contiene títulos (es el nombre desnudo)."""
+    bare = _normalize_name(original).replace(",", "").replace(".", "")
+    return bare == stripped
+
+
+# Máximo de tokens adicionales permitidos en el nombre más largo
+# al comparar por suffix/prefix. Evita que nombres compuestos extraídos
+# por el LLM (p. ej. "Sherlock Holmes, detective for the King") actúen
+# como puentes entre grupos distintos.
+_MAX_EXTRA_TOKENS = 2
+
+
+def _is_word_suffix(short: str, long: str) -> bool:
+    """True si 'short' coincide exactamente con los últimos tokens de 'long'
+    y la diferencia de longitud no supera _MAX_EXTRA_TOKENS.
+
+    Ejemplo: 'holmes' es suffix de 'sherlock holmes' (diff=1) ✓
+             'norton' NO es suffix de 'irene norton adler' (último token='adler') ✗
+             'holmes' NO es suffix de 'sherlock holmes detective for the king' (diff=5) ✗
+    """
+    s = short.split()
+    l = long.split()
+    return (
+        0 < len(s) <= len(l)
+        and len(l) - len(s) <= _MAX_EXTRA_TOKENS
+        and l[-len(s):] == s
+    )
+
+
+def _is_word_prefix(short: str, long: str) -> bool:
+    """True si 'short' coincide exactamente con los primeros tokens de 'long'
+    y la diferencia de longitud no supera _MAX_EXTRA_TOKENS.
+
+    Ejemplo: 'king' es prefix de 'king of bohemia' (diff=2) ✓
+             'sherlock holmes' NO es prefix de 'sherlock holmes detective for...' (diff>2) ✗
+    """
+    s = short.split()
+    l = long.split()
+    return (
+        0 < len(s) <= len(l)
+        and len(l) - len(s) <= _MAX_EXTRA_TOKENS
+        and l[:len(s)] == s
+    )
+
+
+def _rule_based_same_character(name_a: str, name_b: str) -> bool:
+    """Devuelve True si dos cadenas de nombre probablemente refieren al mismo personaje.
+
+    Aplica dos heurísticas en orden:
+    1. Igualdad exacta tras eliminar títulos.
+       Excepción: si el resultado es un único token y AMBOS originales son
+       solo título+apellido (sin nombre de pila), no se fusionan —
+       p. ej. "Miss Stoner" ≠ "Mrs. Stoner" (personajes distintos de la misma familia).
+    2. Uno de los nombres (sin títulos) es SUFFIX o PREFIX por tokens del otro.
+       Usa word-boundary, NO substring arbitrario — esto evita que 'norton' en
+       'irene norton adler' cause una fusión incorrecta con 'Godfrey Norton'.
+
+    No usa embeddings semánticos: los embeddings de texto corto confunden
+    nombres de personajes distintos del mismo dominio (todos se agrupan).
+
+    Args:
+        name_a: Primer nombre candidato.
+        name_b: Segundo nombre candidato.
+
+    Returns:
+        True si las heurísticas indican que son el mismo personaje.
+    """
+    a = _strip_titles(name_a)
+    b = _strip_titles(name_b)
+    if not a or not b:
+        return False
+
+    # 1. Igualdad exacta tras strip de títulos
+    if a == b:
+        # Caso especial: token único y ambos originales son "título + apellido"
+        # (ninguno tiene nombre de pila) → probablemente personas distintas
+        # de la misma familia. Requiere que al menos uno sea el nombre desnudo.
+        if len(a.split()) == 1 and not _is_bare_name(name_a, a) and not _is_bare_name(name_b, b):
+            return False
+        return True
+
+    # 2. Word-boundary suffix o prefix: 'holmes' suffix de 'sherlock holmes',
+    #    'king' prefix de 'king of bohemia'.
+    #    Se excluye el substring arbitrario para evitar falsos positivos como
+    #    'norton' (substring de 'irene norton adler' pero NO suffix).
+    if _is_word_suffix(a, b) or _is_word_suffix(b, a):
+        return True
+    if _is_word_prefix(a, b) or _is_word_prefix(b, a):
+        return True
+
+    return False
+
+
+def _merge_entity_group(group: list, name_attr: str = "name") -> object:
+    """Fusiona un grupo de entidades en una sola instancia.
+
+    Elige el nombre canónico más completo, combina
+    aliases y concatena descripciones únicas.
+
+    Args:
+        group: Lista de instancias de entidad del mismo tipo.
+        name_attr: Nombre del atributo que actúa como identificador principal.
+
+    Returns:
+        Una única instancia de entidad fusionada.
+    """
+    if len(group) == 1:
+        return group[0]
+
+    # Nombre canónico = la variante más larga
+    canonical = max(group, key=lambda e: len(getattr(e, name_attr, "")))
+
+    updates: dict = {}
+
+    # Construye aliases a partir de los nombres reales con que apareció
+    # el personaje en distintos chunks — no del LLM.
+    if hasattr(canonical, "aliases"):
+        all_aliases: set[str] = set()
+        for entity in group:
+            all_aliases.add(getattr(entity, name_attr, ""))
+        all_aliases.discard(getattr(canonical, name_attr))
+        updates["aliases"] = sorted(all_aliases)
+
+    # Combina descriptions si existen
+    if hasattr(canonical, "description"):
+        descs = {
+            getattr(e, "description", "")
+            for e in group
+            if getattr(e, "description", "")
+        }
+        if descs:
+            updates["description"] = " | ".join(sorted(descs))
+
+    return canonical.model_copy(update=updates) if updates else canonical
+
+
+def _build_canonical_map(resolved: EntityExtractionResult) -> dict[str, str]:
+    """Construye un mapa alias_normalizado, nombre_canónico a partir de personajes resueltos.
+
+    Args:
+        resolved: Resultado de entity resolution con nombres canónicos y aliases.
+
+    Returns:
+        Dict que mapea cada alias normalizado al nombre canónico del personaje.
+    """
+    mapping: dict[str, str] = {}
+    for char in resolved.characters:
+        for alias in char.aliases:
+            mapping[_normalize_name(alias)] = char.name
+    return mapping
+
+
+def _remap_relationships(
+    relationships: list[ExtractedRelationship],
+    canonical_map: dict[str, str],
+) -> list[ExtractedRelationship]:
+    """Actualiza source_name y target_name de las relaciones con nombres canónicos.
+
+    Args:
+        relationships: Lista de relaciones extraídas.
+        canonical_map: Mapa alias, nombre canónico (de _build_canonical_map).
+
+    Returns:
+        Lista de relaciones con nombres normalizados.
+    """
+    remapped = []
+    for rel in relationships:
+        source = canonical_map.get(_normalize_name(rel.source_name), rel.source_name)
+        target = canonical_map.get(_normalize_name(rel.target_name), rel.target_name)
+        if source != rel.source_name or target != rel.target_name:
+            rel = rel.model_copy(update={"source_name": source, "target_name": target})
+        remapped.append(rel)
+    return remapped
+
+
+
+# Extractor principal
+
+class EntityExtractor:
+    """Extrae entidades y relaciones de los relatos de Sherlock Holmes.
+
+    Uso de modelos por coste:
+    - LITE: sliding context, desambiguación LLM en entity resolution
+    - FLASH: extracción de entidades y relaciones (alto volumen)
+    """
+
+    # Umbrales de similitud coseno para entity resolution de entidades NO-personaje
+    # (Locations, Objects, Events, Scenes).
+    # Para Characters se usa matching basado en reglas (_rule_based_same_character),
+    # porque los embeddings semánticos de nombres propios cortos son
+    # indistinguibles entre sí y provocan fusiones erróneas.
+    _MERGE_THRESHOLD = 0.92
+    _AMBIGUOUS_THRESHOLD = 0.80
+
+    def __init__(self) -> None:
+        self.gemini = GeminiClient()
+        self.embeddings = EmbeddingClient()
+        self.settings = get_settings()
+
+
+    # Sliding context
+
+    def _update_sliding_context(
+        self,
+        current_context: NarrativeContext,
+        chunk_text: str,
+        extracted_entities: EntityExtractionResult,
+    ) -> NarrativeContext:
+        """Actualiza el contexto narrativo acumulativo tras procesar un chunk.
+
+        Llama a Gemini Flash-Lite para sintetizar el nuevo estado narrativo
+        a partir del contexto previo, el texto del chunk y las entidades
+        recién extraídas.
+
+        Args:
+            current_context: Estado narrativo hasta el chunk anterior.
+            chunk_text: Texto del chunk recién procesado.
+            extracted_entities: Entidades extraídas del chunk actual.
+
+        Returns:
+            NarrativeContext actualizado con la nueva información.
+        """
+        prompt = f"""You are tracking the narrative context of a Sherlock Holmes story.
+
+Current context:
+{current_context.model_dump_json(indent=2)}
+
+New text fragment:
+{chunk_text}
+
+Entities just extracted:
+{extracted_entities.model_dump_json(indent=2)}
+
+Update the narrative context based on the new information.
+Rules:
+- Keep the summary concise (2-3 sentences).
+- Keep only the 3-5 most recent events in recent_events.
+- Update characters_present and current_location based on what happens in this fragment.
+- Add to unresolved_references any pronouns or aliases that lack a clear referent.
+"""
+        return self.gemini.structured_output(
+            prompt=prompt,
+            schema=NarrativeContext,
+            model_tier=ModelTier.LITE,
+            system_instruction=(
+                "You are a narrative tracking assistant for a knowledge graph pipeline. "
+                "You MUST respond with ONLY a valid JSON object matching the provided schema. "
+                "Do NOT include any prose, explanation, or markdown fences. "
+                "Output ONLY the raw JSON object, nothing else."
+            ),
+            temperature=0.0,
+        )
+
+
+    # Extracción multipaso
+
+    def extract_entities(
+        self,
+        chunk_text: str,
+        context: NarrativeContext | None = None,
+        story_title: str = "",
+    ) -> EntityExtractionResult:
+        """Extrae entidades tipadas de un fragmento de texto.
+
+        Incluye el contexto narrativo acumulado en el prompt cuando está
+        disponible, para mejorar la resolución de referencias ambiguas.
+
+        Args:
+            chunk_text: Texto del chunk a analizar.
+            context: Contexto narrativo acumulado hasta este punto.
+            story_title: Título del relato, para anclar el contexto al LLM.
+
+        Returns:
+            EntityExtractionResult con todas las entidades detectadas.
+            Devuelve un resultado vacío si el LLM falla.
+        """
+        context_section = ""
+        if context and context.summary:
+            present = (
+                ", ".join(context.characters_present)
+                if context.characters_present
+                else "unknown"
+            )
+            context_section = (
+                f"NARRATIVE CONTEXT SO FAR:\n{context.summary}\n"
+                f"Characters present: {present}\n"
+                f"Current location: {context.current_location}\n\n"
+            )
+
+        prompt = f"""You are an expert literary analyst specializing in the Sherlock Holmes canon by Arthur Conan Doyle.
+
+Extract all entities from the following text fragment of the story "{story_title}".
+
+{context_section}TEXT TO ANALYZE:
+{chunk_text}
+
+Extract:
+- Characters: named persons with their occupation and role. Extract the name EXACTLY as it appears in this fragment (e.g. "Holmes", or "Mr. Sherlock Holmes", or "Dr. Watson" — whichever form is used here). Each character gets one entry per fragment; do not list other characters as part of this entry.
+- Locations: named places with their type (city/building/street/region/country)
+- Crimes: ONLY the main crime or central mystery of this fragment (1-3 maximum). Do not extract minor mentions, referenced past crimes, or hypothetical crimes.
+- Objects: ONLY objects that are clues, weapons, or pivotal to the plot. Ignore generic furniture, clothing, and incidental items.
+- Deductions: reasoning chains by Holmes (observation → inference → conclusion)
+- Scenes: narrative units (a scene changes when location, time, or present characters change significantly)
+- Events: key plot events
+
+Be thorough with named entities. For characters, list ALL proper name variants used in the text as aliases."""
+
+        try:
+            return self.gemini.structured_output(
+                prompt=prompt,
+                schema=EntityExtractionResult,
+                model_tier=ModelTier.FLASH,
+                system_instruction=(
+                    "You are a knowledge graph entity extractor. "
+                    "Extract entities precisely as they appear in the text."
+                ),
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning("Error extrayendo entidades: %s. Devolviendo resultado vacío.", exc)
+            return EntityExtractionResult()
+
+    def extract_relationships(
+        self,
+        chunk_text: str,
+        entities: EntityExtractionResult,
+        context: NarrativeContext | None = None,
+    ) -> RelationshipExtractionResult:
+        """Extrae relaciones entre las entidades ya identificadas.
+
+        Recibe las entidades del Paso 1 para proporcionar al LLM la lista
+        exacta de nodos entre los que buscar conexiones.
+
+        Args:
+            chunk_text: Texto original del chunk.
+            entities: Entidades extraídas en el Paso 1.
+            context: Contexto narrativo acumulado (opcional).
+
+        Returns:
+            RelationshipExtractionResult con las relaciones detectadas.
+            Devuelve un resultado vacío si el LLM falla.
+        """
+        character_names = [c.name for c in entities.characters]
+        location_names = [loc.name for loc in entities.locations]
+        crime_types = [c.type for c in entities.crimes]
+        object_names = [o.name for o in entities.objects]
+        scene_titles = [s.title for s in entities.scenes]
+        event_names = [e.name for e in entities.events]
+
+        entities_lines = [
+            f"Characters: {', '.join(character_names)}" if character_names else "",
+            f"Locations: {', '.join(location_names)}" if location_names else "",
+            f"Crimes: {', '.join(crime_types)}" if crime_types else "",
+            f"Objects: {', '.join(object_names)}" if object_names else "",
+            f"Scenes: {', '.join(scene_titles)}" if scene_titles else "",
+            f"Events: {', '.join(event_names)}" if event_names else "",
+        ]
+        entities_section = "\n".join(line for line in entities_lines if line)
+
+        prompt = f"""You are extracting relationships for a knowledge graph about Sherlock Holmes stories.
+
+TEXT:
+{chunk_text}
+
+ENTITIES FOUND:
+{entities_section}
+
+Extract relationships between these entities. Valid relationship types:
+- APPEARS_IN: Character → Story (with role: protagonist/antagonist/client/witness/victim)
+- KNOWS: Character → Character (with relationship_type: friend/enemy/colleague/family/acquaintance)
+- INVESTIGATES: Character → Crime (with role: investigator/suspect/perpetrator/victim)
+- USES: Character → Object (with context)
+- FOUND_AT: Object → Location
+- PRESENT_IN: Character → Scene
+- TAKES_PLACE_IN: Scene → Location
+- FOLLOWS: Scene → Scene (scene that immediately follows another in narrative order)
+- BASED_ON: Deduction → Object or Event
+- LEADS_TO: Deduction → Deduction (for reasoning chains)
+- PARTICIPATES_IN: Character → Event
+
+Only extract relationships that are explicitly supported by the text. Include the specific property values (role, relationship_type, etc.) for each relationship."""
+
+        try:
+            return self.gemini.structured_output(
+                prompt=prompt,
+                schema=RelationshipExtractionResult,
+                model_tier=ModelTier.FLASH,
+                system_instruction=(
+                    "You are a knowledge graph relationship extractor. "
+                    "Only extract relationships explicitly supported by the text."
+                ),
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning("Error extrayendo relaciones: %s. Devolviendo resultado vacío.", exc)
+            return RelationshipExtractionResult()
+
+
+    # Entity resolution
+
+    def _llm_confirm_same_entity(
+        self, name_a: str, name_b: str, entity_type: str
+    ) -> bool:
+        """Pregunta al LLM si dos nombres corresponden a la misma entidad.
+
+        Args:
+            name_a: Primer nombre candidato.
+            name_b: Segundo nombre candidato.
+            entity_type: Tipo de entidad (Character, Location, etc.).
+
+        Returns:
+            True si el LLM confirma que son la misma entidad.
+        """
+        class _SameEntityResponse(BaseModel):
+            same: bool
+            canonical_name: str = ""
+
+        prompt = (
+            f"Are '{name_a}' and '{name_b}' the same {entity_type} "
+            f"in the Sherlock Holmes stories? Answer with JSON."
+        )
+        try:
+            result = self.gemini.structured_output(
+                prompt=prompt,
+                schema=_SameEntityResponse,
+                model_tier=ModelTier.LITE,
+                temperature=0.0,
+            )
+            return result.same
+        except Exception as exc:
+            logger.warning(
+                "Error en LLM entity resolution para '%s'/'%s': %s", name_a, name_b, exc
+            )
+            return False
+
+    def _resolve_typed_entities(
+        self,
+        entities: list,
+        entity_type: str,
+        name_attr: str = "name",
+    ) -> list:
+        """Resuelve duplicados en una lista de entidades del mismo tipo.
+
+        Args:
+            entities: Lista de instancias de entidad.
+            entity_type: Nombre del tipo (para el prompt LLM).
+            name_attr: Atributo que actúa como nombre primario de la entidad.
+
+        Returns:
+            Lista de entidades deduplicadas y fusionadas.
+        """
+        if not entities:
+            return []
+
+        #agrupación por nombre normalizado
+        groups: dict[str, list] = {}
+        for entity in entities:
+            key = _normalize_name(getattr(entity, name_attr, ""))
+            groups.setdefault(key, []).append(entity)
+
+        merged = [_merge_entity_group(g, name_attr) for g in groups.values()]
+
+        if len(merged) <= 1:
+            return merged
+
+        to_merge: list[tuple[int, int]] = []
+
+        if entity_type == "Character":
+            # Para personajes: matching puramente basado en reglas lingüísticas.
+            # Los embeddings semánticos de nombres propios cortos dan similitudes
+            # altas entre personajes distintos del mismo dominio, causando que
+            # todos los personajes de un relato se fusionen en uno solo.
+            logger.debug("Character resolution — %d nombres únicos: %s",
+                         len(merged), [getattr(e, name_attr) for e in merged])
+            for i in range(len(merged)):
+                for j in range(i + 1, len(merged)):
+                    name_a = getattr(merged[i], name_attr)
+                    name_b = getattr(merged[j], name_attr)
+                    if _rule_based_same_character(name_a, name_b):
+                        to_merge.append((i, j))
+        else:
+            # Para Location, Object, Event, Scene: embeddings con umbral alto.
+            names = [getattr(e, name_attr) for e in merged]
+            try:
+                embeddings = self.embeddings.embed(names)
+            except Exception as exc:
+                logger.warning("Error generando embeddings para entity resolution: %s", exc)
+                return merged
+
+            rule_merged_pairs: set[tuple[int, int]] = set()
+            llm_candidates: list[tuple[int, int]] = []
+
+            for i in range(len(merged)):
+                for j in range(i + 1, len(merged)):
+                    sim = cosine_similarity(embeddings[i], embeddings[j])
+                    if sim > self._MERGE_THRESHOLD:
+                        to_merge.append((i, j))
+                        rule_merged_pairs.add((i, j))
+                    elif sim > self._AMBIGUOUS_THRESHOLD:
+                        llm_candidates.append((i, j))
+
+            # LLM para zona gris (solo entidades no-personaje)
+            for i, j in llm_candidates:
+                name_a = getattr(merged[i], name_attr)
+                name_b = getattr(merged[j], name_attr)
+                if self._llm_confirm_same_entity(name_a, name_b, entity_type):
+                    to_merge.append((i, j))
+
+        if not to_merge:
+            return merged
+
+        # Union-Find para agrupar componentes conectadas
+        parent = list(range(len(merged)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, j in to_merge:
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        root_to_group: dict[int, list] = {}
+        for idx, entity in enumerate(merged):
+            root_to_group.setdefault(_find(idx), []).append(entity)
+
+        return [_merge_entity_group(g, name_attr) for g in root_to_group.values()]
+
+    def resolve_entities(
+        self,
+        all_entities: list[EntityExtractionResult],
+    ) -> EntityExtractionResult:
+        """Consolida y deduplicada entidades acumuladas de todos los chunks.
+
+        Args:
+            all_entities: Lista de EntityExtractionResult, uno por chunk.
+
+        Returns:
+            EntityExtractionResult consolidado con entidades deduplicadas.
+        """
+        # Descartar aliases que haya generado el LLM — se reconstruyen desde
+        # los nombres reales de cada chunk en _merge_entity_group.
+        characters = [
+            c.model_copy(update={"aliases": []})
+            for r in all_entities for c in r.characters
+        ]
+        locations = [e for r in all_entities for e in r.locations]
+        crimes = [e for r in all_entities for e in r.crimes]
+        objects = [e for r in all_entities for e in r.objects]
+        deductions = [e for r in all_entities for e in r.deductions]
+        scenes = [e for r in all_entities for e in r.scenes]
+        events = [e for r in all_entities for e in r.events]
+
+        # Filtrar referencias genéricas que el LLM extrae como personajes:
+        # pronombres, artículos solos, referencias sin nombre propio.
+        _GENERIC_REFS = frozenset({
+            "i", "we", "he", "she", "they", "you", "it",
+            "him", "her", "them", "us", "me",
+            "the man", "the woman", "the boy", "the girl", "the lady",
+            "the gentleman", "a man", "a woman", "a gentleman",
+        })
+        characters = [
+            c for c in characters
+            if _normalize_name(c.name) not in _GENERIC_REFS
+            and len(_normalize_name(c.name)) > 1
+        ]
+
+        logger.info(
+            "Entity resolution: %d chars, %d locs, %d objects, %d scenes, %d events",
+            len(characters), len(locations), len(objects), len(scenes), len(events),
+        )
+
+        return EntityExtractionResult(
+            characters=self._resolve_typed_entities(characters, "Character"),
+            locations=self._resolve_typed_entities(locations, "Location"),
+            crimes=crimes,
+            objects=self._resolve_typed_entities(objects, "Object"),
+            deductions=deductions,
+            scenes=self._resolve_typed_entities(scenes, "Scene", name_attr="title"),
+            events=self._resolve_typed_entities(events, "Event"),
+        )
+
+    # Pipeline completo de un relato
+
+
+    def process_story_chunks(
+        self,
+        chunks: list[dict],
+        story_title: str,
+    ) -> dict:
+        """Orquesta la extracción completa de un relato chunk a chunk.
+
+        Args:
+            chunks: Lista de dicts de chunks (salida de chunk_story_with_metadata).
+            story_title: Título del relato.
+
+        Returns:
+            Dict con claves: story_title, entities (EntityExtractionResult
+            consolidado), relationships (list[ExtractedRelationship]) y
+            chunks_processed (int).
+        """
+        context = NarrativeContext()
+        all_entity_results: list[EntityExtractionResult] = []
+        all_relationships: list[ExtractedRelationship] = []
+        chunk_entities: list[dict] = []
+        total = len(chunks)
+
+        for i, chunk in enumerate(tqdm(chunks, desc=f"Extrayendo '{story_title}'")):
+            chunk_text = chunk["text"]
+            logger.info("Procesando chunk %d/%d de '%s'", i + 1, total, story_title)
+
+            # entidades
+            entities = self.extract_entities(chunk_text, context, story_title)
+            all_entity_results.append(entities)
+
+            # recoge nombres de entidades de este chunk para MENTIONS
+            names = (
+                [c.name for c in entities.characters]
+                + [l.name for l in entities.locations]
+                + [o.name for o in entities.objects]
+            )
+            chunk_entities.append({
+                "chunk_id": chunk.get("id", ""),
+                "entity_names": names,
+            })
+
+            # relaciones
+            relationships = self.extract_relationships(chunk_text, entities, context)
+            all_relationships.extend(relationships.relationships)
+
+            # Actualiza contexto para el siguiente chunk
+            try:
+                context = self._update_sliding_context(context, chunk_text, entities)
+            except Exception as exc:
+                logger.warning(
+                    "Error actualizando contexto en chunk %d/%d: %s", i + 1, total, exc
+                )
+
+        # Entity resolution
+        logger.info("Iniciando entity resolution para '%s' (%d chunks)...", story_title, total)
+        consolidated = self.resolve_entities(all_entity_results)
+
+        # Normaliza referencias en las relaciones con los nombres canónicos
+        canonical_map = _build_canonical_map(consolidated)
+        resolved_relationships = _remap_relationships(all_relationships, canonical_map)
+
+        logger.info(
+            "'%s': %d entidades consolidadas, %d relaciones extraídas.",
+            story_title,
+            sum([
+                len(consolidated.characters),
+                len(consolidated.locations),
+                len(consolidated.crimes),
+                len(consolidated.objects),
+                len(consolidated.deductions),
+                len(consolidated.scenes),
+                len(consolidated.events),
+            ]),
+            len(resolved_relationships),
+        )
+
+        # serializar a dict para que neo4j_manager.store_entities/store_relationships
+        # y el notebook puedan usar acceso de dict (.get()) en lugar de atributos Pydantic.
+        return {
+            "story_title": story_title,
+            "entities": consolidated.model_dump(),
+            "relationships": [r.model_dump() for r in resolved_relationships],
+            "chunks_processed": total,
+            "chunk_entities": chunk_entities,
+        }
