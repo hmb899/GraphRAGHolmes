@@ -969,6 +969,7 @@ Only extract relationships that are explicitly supported by the text. Include th
         known_names: set[str] = (
             {c["name"] for c in consolidated.model_dump().get("characters", [])}
             | {l["name"] for l in consolidated.model_dump().get("locations", [])}
+            | {c["name"] for c in consolidated.model_dump().get("crimes", [])}
             | {o["name"] for o in consolidated.model_dump().get("objects", [])}
             | {s["title"] for s in consolidated.model_dump().get("scenes", [])}
             | {e["name"] for e in consolidated.model_dump().get("events", [])}

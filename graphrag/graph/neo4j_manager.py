@@ -38,9 +38,10 @@ def _fuzzy_match(query: str, candidates: set[str], threshold: float = 0.35) -> s
     return best if best_score >= threshold else None
 
 
-# Tipos de relación que usan Scene o Event como extremo (candidatos a fuzzy match).
+# Tipos de relación candidatos a fuzzy match por tipo de entidad afectada.
 _SCENE_REL_TYPES = {"PRESENT_IN", "TAKES_PLACE_IN", "FOLLOWS"}
 _EVENT_REL_TYPES = {"PARTICIPATES_IN"}
+_LOCATION_REL_TYPES = {"FOUND_AT", "LIVES_AT", "OCCURS_IN", "TAKES_PLACE_IN"}
 
 
 # Tipos de relación que requieren nodos de cada etiqueta concreta.
@@ -350,9 +351,20 @@ class Neo4jManager:
         # similar absorba la relación equivocada.
         has_scene_rels = any(r.get("relationship_type") in _SCENE_REL_TYPES for r in relationships)
         has_event_rels = any(r.get("relationship_type") in _EVENT_REL_TYPES for r in relationships)
+        has_location_rels = any(r.get("relationship_type") in _LOCATION_REL_TYPES for r in relationships)
 
         scene_titles: set[str] = set()
         event_names: set[str] = set()
+        location_names: set[str] = set()
+
+        if has_location_rels:
+            location_names = {
+                row["name"]
+                for row in self.execute_query(
+                    "MATCH (l:Location) WHERE l.name IS NOT NULL RETURN l.name AS name"
+                )
+                if row["name"]
+            }
 
         if has_scene_rels:
             query = (
@@ -410,6 +422,14 @@ class Neo4jManager:
                     matched = _fuzzy_match(target, event_names)
                     if matched and matched != target:
                         logger.debug("Fuzzy Event tgt: %r -> %r", target, matched)
+                        target = matched
+
+            # Fuzzy matching para Location (umbral más alto para evitar falsos positivos)
+            if rel_type in _LOCATION_REL_TYPES and location_names:
+                if tgt_label == "Location" and tgt_key == "name":
+                    matched = _fuzzy_match(target, location_names, threshold=0.55)
+                    if matched and matched != target:
+                        logger.debug("Fuzzy Location tgt: %r -> %r", target, matched)
                         target = matched
 
             query = f"""
