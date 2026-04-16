@@ -377,6 +377,36 @@ def _build_canonical_map(resolved: EntityExtractionResult) -> dict[str, str]:
     return mapping
 
 
+def _rule_based_same_location(name_a: str, name_b: str) -> bool:
+    """Detecta si dos nombres de lugar son el mismo sitio por contenimiento de tokens.
+
+    Captura casos como:
+      "Baker Street" ↔ "Baker Street lodgings"
+      "Baker Street" ↔ "sitting-room at Baker Street"
+      "Baker Street" ↔ "221B Baker Street"
+      "Oxford Street" ↔ "Oxford Street, London"
+    Requiere ≥2 tokens en el nombre más corto para evitar falsos positivos
+    con nombres de una sola palabra ("London" ≠ "London Bridge").
+    """
+    a = _normalize_name(name_a)
+    b = _normalize_name(name_b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+
+    def _tokens(s: str) -> set[str]:
+        """Tokeniza eliminando puntuación para que 'street,' == 'street'."""
+        import re
+        return {t for t in re.sub(r"[^a-z0-9\s]", "", s).split() if t}
+
+    tokens_a = _tokens(a)
+    tokens_b = _tokens(b)
+    shorter = tokens_a if len(tokens_a) <= len(tokens_b) else tokens_b
+    longer  = tokens_b if len(tokens_a) <= len(tokens_b) else tokens_a
+    return len(shorter) >= 2 and shorter.issubset(longer)
+
+
 def _remap_relationships(
     relationships: list[ExtractedRelationship],
     canonical_map: dict[str, str],
@@ -447,6 +477,18 @@ class EntityExtractor:
         Returns:
             NarrativeContext actualizado con la nueva información.
         """
+        # Resumen compacto de entidades para no inflar el prompt de Flash-Lite
+        chars = [c.name for c in extracted_entities.characters]
+        locs = [l.name for l in extracted_entities.locations]
+        events = [e.name for e in extracted_entities.events]
+        crimes = [c.name for c in extracted_entities.crimes]
+        entities_summary = ", ".join(filter(None, [
+            f"chars: {', '.join(chars)}" if chars else "",
+            f"locs: {', '.join(locs)}" if locs else "",
+            f"events: {', '.join(events[:3])}" if events else "",
+            f"crimes: {', '.join(crimes)}" if crimes else "",
+        ]))
+
         prompt = f"""You are tracking the narrative context of a Sherlock Holmes story.
 
 Current context:
@@ -455,8 +497,7 @@ Current context:
 New text fragment:
 {chunk_text}
 
-Entities just extracted:
-{extracted_entities.model_dump_json(indent=2)}
+Entities just extracted: {entities_summary}
 
 Update the narrative context based on the new information.
 Rules:
@@ -724,6 +765,19 @@ Only extract relationships that are explicitly supported by the text. Include th
                         to_merge.append((i, j))
         else:
             # Para Location, Object, Event, Scene: embeddings con umbral alto.
+
+            # Pre-paso solo para Location: regla de contenimiento de tokens.
+            # Captura "Baker Street" ↔ "Baker Street lodgings" sin necesitar embeddings.
+            already_merged: set[tuple[int, int]] = set()
+            if entity_type == "Location":
+                for i in range(len(merged)):
+                    for j in range(i + 1, len(merged)):
+                        na = getattr(merged[i], name_attr)
+                        nb = getattr(merged[j], name_attr)
+                        if _rule_based_same_location(na, nb):
+                            to_merge.append((i, j))
+                            already_merged.add((i, j))
+
             names = [getattr(e, name_attr) for e in merged]
             try:
                 embeddings = self.embeddings.embed(names)
@@ -736,6 +790,8 @@ Only extract relationships that are explicitly supported by the text. Include th
 
             for i in range(len(merged)):
                 for j in range(i + 1, len(merged)):
+                    if (i, j) in already_merged:
+                        continue
                     sim = cosine_similarity(embeddings[i], embeddings[j])
                     if sim > self._MERGE_THRESHOLD:
                         to_merge.append((i, j))
@@ -836,7 +892,7 @@ Only extract relationships that are explicitly supported by the text. Include th
         return EntityExtractionResult(
             characters=self._resolve_typed_entities(characters, "Character"),
             locations=self._resolve_typed_entities(locations, "Location"),
-            crimes=crimes,
+            crimes=self._resolve_typed_entities(crimes, "Crime"),
             objects=self._resolve_typed_entities(objects, "Object"),
             deductions=deductions,
             scenes=self._resolve_typed_entities(scenes, "Scene", name_attr="title"),
