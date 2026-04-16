@@ -643,7 +643,7 @@ ENTITIES FOUND:
 Extract relationships between these entities. Valid relationship types (ONLY these, no others):
 - APPEARS_IN: Character → Story (with role: protagonist/antagonist/client/witness/victim)
 - KNOWS: Character → Character (with relationship_type: friend/enemy/colleague/family/acquaintance)
-- INVESTIGATES: Character → Crime  ← source_name = EXACT character name, target_name = EXACT crime name from the list above (with role: investigator/suspect/perpetrator/victim)
+- INVESTIGATES: Character → Crime  ← source_name = EXACT character name, target_name = EXACT crime name from the list above (with role: investigator/suspect/perpetrator/victim). MANDATORY: if the Crimes list is non-empty and a character in the text is actively involved with that crime (investigating, committing, witnessing, or being victimised), you MUST extract this relationship. Do not omit it.
 - OCCURS_IN: Crime → Location  ← source_name = EXACT crime name from the list above, target_name = EXACT location name
 - USES: Character → Object (with context)
 - FOUND_AT: Object → Location  ← use this when an object is located somewhere (NOT "LOCATED_IN" or "FOUND_IN")
