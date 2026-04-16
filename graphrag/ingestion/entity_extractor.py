@@ -465,58 +465,32 @@ class EntityExtractor:
     ) -> NarrativeContext:
         """Actualiza el contexto narrativo acumulativo tras procesar un chunk.
 
-        Llama a Gemini Flash-Lite para sintetizar el nuevo estado narrativo
-        a partir del contexto previo, el texto del chunk y las entidades
-        recién extraídas.
+        Construye el contexto directamente desde las entidades extraídas,
+        sin llamar al LLM. Esto evita consumir cuota de Flash-Lite y elimina
+        los timeouts que ralentizaban el pipeline cuando se agotaba la cuota.
 
         Args:
             current_context: Estado narrativo hasta el chunk anterior.
-            chunk_text: Texto del chunk recién procesado.
+            chunk_text: Texto del chunk recién procesado (no usado, mantenido por firma).
             extracted_entities: Entidades extraídas del chunk actual.
 
         Returns:
-            NarrativeContext actualizado con la nueva información.
+            NarrativeContext actualizado.
         """
-        # Resumen compacto de entidades para no inflar el prompt de Flash-Lite
         chars = [c.name for c in extracted_entities.characters]
-        locs = [l.name for l in extracted_entities.locations]
+        locs  = [l.name for l in extracted_entities.locations]
         events = [e.name for e in extracted_entities.events]
         crimes = [c.name for c in extracted_entities.crimes]
-        entities_summary = ", ".join(filter(None, [
-            f"chars: {', '.join(chars)}" if chars else "",
-            f"locs: {', '.join(locs)}" if locs else "",
-            f"events: {', '.join(events[:3])}" if events else "",
-            f"crimes: {', '.join(crimes)}" if crimes else "",
-        ]))
 
-        prompt = f"""You are tracking the narrative context of a Sherlock Holmes story.
+        # Mantener los 3 eventos más recientes del contexto anterior + los nuevos
+        recent = (current_context.recent_events + events)[-5:]
 
-Current context:
-{current_context.model_dump_json(indent=2)}
-
-New text fragment:
-{chunk_text}
-
-Entities just extracted: {entities_summary}
-
-Update the narrative context based on the new information.
-Rules:
-- Keep the summary concise (2-3 sentences).
-- Keep only the 3-5 most recent events in recent_events.
-- Update characters_present and current_location based on what happens in this fragment.
-- Add to unresolved_references any pronouns or aliases that lack a clear referent.
-"""
-        return self.gemini.structured_output(
-            prompt=prompt,
-            schema=NarrativeContext,
-            model_tier=ModelTier.LITE,
-            system_instruction=(
-                "You are a narrative tracking assistant for a knowledge graph pipeline. "
-                "You MUST respond with ONLY a valid JSON object matching the provided schema. "
-                "Do NOT include any prose, explanation, or markdown fences. "
-                "Output ONLY the raw JSON object, nothing else."
-            ),
-            temperature=0.0,
+        return NarrativeContext(
+            current_location=locs[0] if locs else current_context.current_location,
+            characters_present=chars if chars else current_context.characters_present,
+            recent_events=recent,
+            active_investigation=crimes[0] if crimes else current_context.active_investigation,
+            unresolved_references=[],
         )
 
 
