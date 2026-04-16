@@ -44,6 +44,10 @@ class LocationEntity(BaseModel):
 class CrimeEntity(BaseModel):
     """Un crimen o misterio central del relato."""
 
+    name: str = Field(
+        ...,
+        description="Short unique name for this crime within the story, e.g. 'Murder of John Straker', 'Disappearance of Silver Blaze', 'Theft of the Blue Carbuncle'",
+    )
     type: str = Field(
         ...,
         description="Tipo: murder/theft/blackmail/fraud/disappearance/assault/other",
@@ -176,8 +180,9 @@ def _normalize_name(name: str) -> str:
 
 # Títulos y honoríficos que no forman parte del nombre propio
 _TITLE_PREFIXES: frozenset[str] = frozenset({
-    "mr", "mrs", "ms", "miss", "dr", "colonel", "col", "major", "captain",
-    "capt", "inspector", "professor", "prof", "sir", "lady", "lord",
+    "mr", "mrs", "ms", "miss", "mister", "mistress", "dr", "doctor",
+    "colonel", "col", "major", "captain", "capt", "inspector",
+    "professor", "prof", "sir", "lady", "lord",
     "young", "old", "the", "a", "an", "née", "esq",
 })
 
@@ -271,12 +276,33 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
     if not a or not b:
         return False
 
+    # Pre-check: "mrs" como título señala a una mujer casada que es una
+    # persona DISTINTA del personaje con el mismo apellido sin ese título.
+    # Si uno de los dos nombres empieza por "mrs" y el otro no, nunca son
+    # el mismo personaje — esto bloquea tanto la comparación por igualdad
+    # como la de suffix/prefix más abajo.
+    # Ej: "Mrs. Watson" ≠ "Watson", "Mrs. Straker" ≠ "John Straker",
+    #     "Mrs. Henry Baker" ≠ "Mr. Henry Baker"
+    tokens_a = _normalize_name(name_a).replace(",", "").replace(".", "").split()
+    tokens_b = _normalize_name(name_b).replace(",", "").replace(".", "").split()
+    mrs_a = bool(tokens_a) and tokens_a[0] == "mrs"
+    mrs_b = bool(tokens_b) and tokens_b[0] == "mrs"
+    if mrs_a != mrs_b:
+        return False
+
     # 1. Igualdad exacta tras strip de títulos
     if a == b:
-        # Caso especial: token único y ambos originales son "título + apellido"
-        # (ninguno tiene nombre de pila) → probablemente personas distintas
-        # de la misma familia. Requiere que al menos uno sea el nombre desnudo.
-        if len(a.split()) == 1 and not _is_bare_name(name_a, a) and not _is_bare_name(name_b, b):
+        # Caso A: token único, ambos con título distinto y sin nombre de pila
+        # → probablemente personas distintas de la misma familia.
+        # Ej: "Miss Stoner" ≠ "Mrs. Stoner"
+        # La guarda `_normalize_name(name_a) != _normalize_name(name_b)` evita
+        # que "Mrs. Hudson" == "Mrs. Hudson" (mismo nombre) dispare este caso.
+        if (
+            len(a.split()) == 1
+            and not _is_bare_name(name_a, a)
+            and not _is_bare_name(name_b, b)
+            and _normalize_name(name_a) != _normalize_name(name_b)
+        ):
             return False
         return True
 
@@ -498,7 +524,7 @@ Extract all entities from the following text fragment of the story "{story_title
 Extract:
 - Characters: named persons with their occupation and role. Extract the name EXACTLY as it appears in this fragment (e.g. "Holmes", or "Mr. Sherlock Holmes", or "Dr. Watson" — whichever form is used here). Each character gets one entry per fragment; do not list other characters as part of this entry.
 - Locations: named places with their type (city/building/street/region/country)
-- Crimes: ONLY the main crime or central mystery of this fragment (1-3 maximum). Do not extract minor mentions, referenced past crimes, or hypothetical crimes.
+- Crimes: ONLY the main crime or central mystery of this fragment (1-3 maximum). Do not extract minor mentions, referenced past crimes, or hypothetical crimes. Give each crime a short, unique, descriptive name (e.g. "Murder of John Straker", "Theft of the Blue Carbuncle", "Disappearance of Silver Blaze").
 - Objects: ONLY objects that are clues, weapons, or pivotal to the plot. Ignore generic furniture, clothing, and incidental items.
 - Deductions: reasoning chains by Holmes (observation → inference → conclusion)
 - Scenes: narrative units (a scene changes when location, time, or present characters change significantly)
@@ -543,16 +569,23 @@ Be thorough with named entities. For characters, list ALL proper name variants u
         """
         character_names = [c.name for c in entities.characters]
         location_names = [loc.name for loc in entities.locations]
-        crime_types = [c.type for c in entities.crimes]
+        crime_names = [c.name for c in entities.crimes]
         object_names = [o.name for o in entities.objects]
+        deduction_obs = [d.observation for d in entities.deductions]
         scene_titles = [s.title for s in entities.scenes]
         event_names = [e.name for e in entities.events]
+
+        deduction_block = (
+            "Deductions (identified by observation text):\n"
+            + "\n".join(f"  - {obs}" for obs in deduction_obs)
+        ) if deduction_obs else ""
 
         entities_lines = [
             f"Characters: {', '.join(character_names)}" if character_names else "",
             f"Locations: {', '.join(location_names)}" if location_names else "",
-            f"Crimes: {', '.join(crime_types)}" if crime_types else "",
+            f"Crimes: {', '.join(crime_names)}" if crime_names else "",
             f"Objects: {', '.join(object_names)}" if object_names else "",
+            deduction_block,
             f"Scenes: {', '.join(scene_titles)}" if scene_titles else "",
             f"Events: {', '.join(event_names)}" if event_names else "",
         ]
@@ -566,19 +599,29 @@ TEXT:
 ENTITIES FOUND:
 {entities_section}
 
-Extract relationships between these entities. Valid relationship types:
+Extract relationships between these entities. Valid relationship types (ONLY these, no others):
 - APPEARS_IN: Character → Story (with role: protagonist/antagonist/client/witness/victim)
 - KNOWS: Character → Character (with relationship_type: friend/enemy/colleague/family/acquaintance)
-- INVESTIGATES: Character → Crime (with role: investigator/suspect/perpetrator/victim)
+- INVESTIGATES: Character → Crime  ← source_name = EXACT character name, target_name = EXACT crime name from the list above (with role: investigator/suspect/perpetrator/victim)
+- OCCURS_IN: Crime → Location  ← source_name = EXACT crime name from the list above, target_name = EXACT location name
 - USES: Character → Object (with context)
-- FOUND_AT: Object → Location
-- PRESENT_IN: Character → Scene
-- TAKES_PLACE_IN: Scene → Location
-- FOLLOWS: Scene → Scene (scene that immediately follows another in narrative order)
-- BASED_ON: Deduction → Object or Event
-- LEADS_TO: Deduction → Deduction (for reasoning chains)
-- PARTICIPATES_IN: Character → Event
+- FOUND_AT: Object → Location  ← use this when an object is located somewhere (NOT "LOCATED_IN" or "FOUND_IN")
+- LIVES_AT: Character → Location  ← use this when a character resides at or operates from a location (home, office, lair)
+- PRESENT_IN: Character → Scene  ← source_name = EXACT character name, target_name = EXACT scene title from the list above
+- TAKES_PLACE_IN: Scene → Location  ← source_name = EXACT scene title from the list above (NOT "LOCATED_IN")
+- FOLLOWS: Scene → Scene  ← both source_name and target_name = EXACT scene titles from the list above
+- BASED_ON: Deduction → Object or Event  (source_name = the EXACT observation text of the deduction, as listed above)
+- LEADS_TO: Deduction → Deduction  (source_name and target_name = the EXACT observation text of each deduction)
+- PARTICIPATES_IN: Character → Event  ← source_name = EXACT character name, target_name = EXACT event name from the list above
 
+CRITICAL NAMING RULES — failure to follow these will break the knowledge graph:
+- For PRESENT_IN, TAKES_PLACE_IN, FOLLOWS: use ONLY scene titles that appear verbatim in the "Scenes:" list above. Do NOT paraphrase, shorten, or invent new scene titles.
+- For PARTICIPATES_IN: use ONLY event names that appear verbatim in the "Events:" list above. Do NOT paraphrase, shorten, or invent new event names.
+- For INVESTIGATES and OCCURS_IN: use ONLY crime names that appear verbatim in the "Crimes:" list above. Do NOT use the crime type ("murder", "theft", etc.) — use the full crime name.
+- If the text describes an action that fits a scene, event, or crime not in the list, skip that relationship rather than inventing a name.
+
+IMPORTANT: Do NOT invent relationship types. Only use the exact types listed above.
+Do not use LOCATED_IN, FOUND_IN, LIVES_IN, RESIDES_AT, OCCURRED_AT, HAPPENS_AT, or any other type not in this list.
 Only extract relationships that are explicitly supported by the text. Include the specific property values (role, relationship_type, etc.) for each relationship."""
 
         try:
@@ -755,17 +798,33 @@ Only extract relationships that are explicitly supported by the text. Include th
         scenes = [e for r in all_entities for e in r.scenes]
         events = [e for r in all_entities for e in r.events]
 
-        # Filtrar referencias genéricas que el LLM extrae como personajes:
-        # pronombres, artículos solos, referencias sin nombre propio.
-        _GENERIC_REFS = frozenset({
+        # Filtrar referencias genéricas que el LLM extrae como personajes.
+        # Usa matching por prefijo para cubrir "the X", "a X", "my X", etc.
+        # independientemente de qué sea X, más exact-match para pronombres y
+        # roles sueltos sin artículo.
+        _GENERIC_PREFIXES: tuple[str, ...] = (
+            "the ", "a ", "an ",              # artículos: "the lad", "a rough"
+            "my ", "your ", "his ", "her ",   # posesivos: "my uncle Elias", "her lawyer"
+            "our ", "this ", "that ",         # otros determinantes
+        )
+        _GENERIC_EXACT: frozenset[str] = frozenset({
+            # Pronombres
             "i", "we", "he", "she", "they", "you", "it",
             "him", "her", "them", "us", "me",
-            "the man", "the woman", "the boy", "the girl", "the lady",
-            "the gentleman", "a man", "a woman", "a gentleman",
+            # Roles sueltos sin artículo ni nombre propio
+            "doctor", "inspector", "narrator", "gentleman",
+            "companion", "stranger", "visitor", "assistant",
+            "husband", "wife", "maid", "porter", "lad",
+            "coachman", "landlord", "landlady",
         })
+
+        def _is_generic(name: str) -> bool:
+            n = _normalize_name(name)
+            return any(n.startswith(p) for p in _GENERIC_PREFIXES) or n in _GENERIC_EXACT
+
         characters = [
             c for c in characters
-            if _normalize_name(c.name) not in _GENERIC_REFS
+            if not _is_generic(c.name)
             and len(_normalize_name(c.name)) > 1
         ]
 
@@ -848,6 +907,26 @@ Only extract relationships that are explicitly supported by the text. Include th
         canonical_map = _build_canonical_map(consolidated)
         resolved_relationships = _remap_relationships(all_relationships, canonical_map)
 
+        # Elimina relaciones cuyo source no corresponde a ninguna entidad conocida.
+        # Esto descarta relaciones con "I", "my wife", etc. que sobrevivieron
+        # al chunk-level y no tienen contraparte canónica tras la entity resolution.
+        known_names: set[str] = (
+            {c["name"] for c in consolidated.model_dump().get("characters", [])}
+            | {l["name"] for l in consolidated.model_dump().get("locations", [])}
+            | {o["name"] for o in consolidated.model_dump().get("objects", [])}
+            | {s["title"] for s in consolidated.model_dump().get("scenes", [])}
+            | {e["name"] for e in consolidated.model_dump().get("events", [])}
+            | {d["observation"] for d in consolidated.model_dump().get("deductions", [])}
+        )
+        before = len(resolved_relationships)
+        resolved_relationships = [
+            r for r in resolved_relationships
+            if r.source_name in known_names
+        ]
+        dropped = before - len(resolved_relationships)
+        if dropped:
+            logger.info("Filtradas %d relaciones huerfanas (source no canónico).", dropped)
+
         logger.info(
             "'%s': %d entidades consolidadas, %d relaciones extraídas.",
             story_title,
@@ -872,3 +951,146 @@ Only extract relationships that are explicitly supported by the text. Include th
             "chunks_processed": total,
             "chunk_entities": chunk_entities,
         }
+
+    # Cross-story normalization
+
+    def normalize_cross_story_entities(
+        self, all_results: dict[str, dict]
+    ) -> dict[str, dict]:
+        """Unifica nombres canónicos de Characters entre todos los relatos.
+
+        La entity resolution por relato puede elegir variantes distintas como
+        nombre canónico para el mismo personaje (p. ej. 'Mr. Sherlock Holmes'
+        en un relato, 'Sherlock Holmes' en otro). Al hacer MERGE en Neo4j,
+        esto produce nodos duplicados.
+
+        Este método recorre todos los resultados, agrupa variantes equivalentes
+        mediante _rule_based_same_character y elige un único canónico global
+        (preferencia: nombre sin títulos honoríficos, luego el más largo).
+        Actualiza nombres en entidades y relaciones de todos los relatos.
+
+        Args:
+            all_results: Dict {story_title: result_dict} devuelto por
+                         process_story_chunks para cada relato.
+
+        Returns:
+            Nuevo dict con los mismos relatos pero nombres canónicos unificados.
+        """
+        # 1. Recoger todos los nombres canónicos de Character
+        all_names = sorted({
+            char["name"]
+            for result in all_results.values()
+            for char in result["entities"].get("characters", [])
+        })
+        if not all_names:
+            return all_results
+
+        # 2. Union-Find entre variantes equivalentes cross-story
+        parent = list(range(len(all_names)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(len(all_names)):
+            for j in range(i + 1, len(all_names)):
+                if _rule_based_same_character(all_names[i], all_names[j]):
+                    ri, rj = _find(i), _find(j)
+                    if ri != rj:
+                        parent[rj] = ri
+
+        # 3. Agrupar por componente
+        groups: dict[int, list[str]] = {}
+        for idx, name in enumerate(all_names):
+            groups.setdefault(_find(idx), []).append(name)
+
+        # 4. Elegir nombre canónico global por grupo.
+        #    Criterio (por prioridad):
+        #    a) Frecuencia: cuántos relatos usan este nombre como canónico.
+        #       El más frecuente es el más "estable" en el corpus.
+        #    b) Nombre desnudo (sin títulos honoríficos).
+        #    c) Más tokens en el nombre desnudo (más descriptivo).
+        #    d) Orden alfabético como desempate final.
+        name_frequency: dict[str, int] = {}
+        for result in all_results.values():
+            for char in result["entities"].get("characters", []):
+                n = char["name"]
+                name_frequency[n] = name_frequency.get(n, 0) + 1
+
+        def _canonical_score(name: str) -> tuple:
+            stripped = _strip_titles(name)
+            is_bare = _normalize_name(name).replace(",", "").replace(".", "") == stripped
+            token_count = len(stripped.split())
+            freq = name_frequency.get(name, 0)
+            return (freq, is_bare, token_count, name)
+
+        rename_map: dict[str, str] = {}
+        for group in groups.values():
+            if len(group) == 1:
+                continue
+            canonical = max(group, key=_canonical_score)
+            for name in group:
+                if name != canonical:
+                    rename_map[name] = canonical
+
+        if not rename_map:
+            logger.info("Cross-story resolution: sin renombrados necesarios.")
+            return all_results
+
+        logger.info(
+            "Cross-story resolution: %d variantes unificadas -> %s",
+            len(rename_map),
+            {v: k for k, v in
+             {rename_map[n]: n for n in rename_map}.items()},
+        )
+
+        # 5. Aplicar rename_map a cada resultado
+        updated: dict[str, dict] = {}
+        for story_title, result in all_results.items():
+            # -- Characters: renombrar y deduplicar fusionados --
+            renamed_chars: dict[str, dict] = {}
+            for char in result["entities"].get("characters", []):
+                old_name = char["name"]
+                new_name = rename_map.get(old_name, old_name)
+                if new_name not in renamed_chars:
+                    renamed_chars[new_name] = dict(char)
+                    renamed_chars[new_name]["name"] = new_name
+                # Fusionar aliases si el canónico ya existía en este relato
+                existing = renamed_chars[new_name]
+                merged_aliases: list[str] = list({
+                    *existing.get("aliases", []),
+                    *char.get("aliases", []),
+                    *([] if old_name == new_name else [old_name]),
+                })
+                # Excluir el propio nombre canónico de los aliases
+                merged_aliases = [a for a in merged_aliases if a != new_name]
+                existing["aliases"] = sorted(merged_aliases)
+
+            new_entities = dict(result["entities"])
+            new_entities["characters"] = list(renamed_chars.values())
+
+            # -- Relationships: renombrar source y target --
+            new_rels = []
+            for rel in result.get("relationships", []):
+                src = rename_map.get(rel["source_name"], rel["source_name"])
+                tgt = rename_map.get(rel["target_name"], rel["target_name"])
+                new_rels.append({**rel, "source_name": src, "target_name": tgt})
+
+            # -- chunk_entities: renombrar nombres de entidades en MENTIONS --
+            new_chunk_entities = []
+            for ce in result.get("chunk_entities", []):
+                renamed_entity_names = [
+                    rename_map.get(n, n) for n in ce.get("entity_names", [])
+                ]
+                new_chunk_entities.append({**ce, "entity_names": renamed_entity_names})
+
+            updated[story_title] = {
+                **result,
+                "entities": new_entities,
+                "relationships": new_rels,
+                "chunk_entities": new_chunk_entities,
+            }
+
+        return updated

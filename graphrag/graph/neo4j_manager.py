@@ -20,16 +20,17 @@ def _sanitize_id(text: str) -> str:
 _REL_SPECS: dict[str, tuple[str, str, str, str]] = {
     "APPEARS_IN":     ("Character", "Story",     "name", "title"),
     "KNOWS":          ("Character", "Character", "name", "name"),
-    "INVESTIGATES":   ("Character", "Crime",     "name", "id"),
+    "INVESTIGATES":   ("Character", "Crime",     "name", "name"),
     "USES":           ("Character", "Object",    "name", "name"),
     "FOUND_AT":       ("Object",    "Location",  "name", "name"),
-    "PRESENT_IN":     ("Character", "Scene",     "name", "id"),
-    "TAKES_PLACE_IN": ("Scene",     "Location",  "id",   "name"),
-    "FOLLOWS":        ("Scene",     "Scene",     "id",   "id"),
-    "BASED_ON":       ("Deduction", "Object",    "id",   "name"),
-    "LEADS_TO":       ("Deduction", "Deduction", "id",   "id"),
-    "PARTICIPATES_IN":("Character", "Event",     "name", "id"),
-    "OCCURS_IN":      ("Crime",     "Location",  "id",   "name"),
+    "LIVES_AT":       ("Character", "Location",  "name", "name"),
+    "PRESENT_IN":     ("Character", "Scene",     "name", "title"),
+    "TAKES_PLACE_IN": ("Scene",     "Location",  "title", "name"),
+    "FOLLOWS":        ("Scene",     "Scene",     "title", "title"),
+    "BASED_ON":       ("Deduction", "Object",    "observation", "name"),
+    "LEADS_TO":       ("Deduction", "Deduction", "observation", "observation"),
+    "PARTICIPATES_IN":("Character", "Event",     "name", "name"),
+    "OCCURS_IN":      ("Crime",     "Location",  "name", "name"),
     "MENTIONS":       ("Chunk",     "Character", "id",   "name"),
 }
 
@@ -68,9 +69,13 @@ class Neo4jManager:
         ]
         indexes = [
             "CREATE INDEX crime_type IF NOT EXISTS FOR (c:Crime) ON (c.type)",
+            "CREATE INDEX crime_name IF NOT EXISTS FOR (c:Crime) ON (c.name)",
             "CREATE INDEX object_name IF NOT EXISTS FOR (o:Object) ON (o.name)",
             "CREATE INDEX event_name IF NOT EXISTS FOR (e:Event) ON (e.name)",
             "CREATE INDEX scene_story IF NOT EXISTS FOR (s:Scene) ON (s.sequence_order)",
+            "CREATE INDEX scene_title IF NOT EXISTS FOR (s:Scene) ON (s.title)",
+            "CREATE INDEX event_id IF NOT EXISTS FOR (e:Event) ON (e.id)",
+            "CREATE INDEX deduction_observation IF NOT EXISTS FOR (d:Deduction) ON (d.observation)",
         ]
         for statement in constraints + indexes:
             try:
@@ -191,20 +196,20 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Location '%s': %s", loc.get("name"), exc)
 
-        # Crimes → id compuesto para evitar colisiones entre relatos
+        # Crimes → MERGE por name (único dentro de cada relato por diseño del LLM)
         for i, crime in enumerate(entities.get("crimes", [])):
-            crime_id = f"{story_id}_crime_{i}"
+            crime_name = crime.get("name", "") or f"{story_id}_crime_{i}"
             try:
                 self.execute_query(
                     """
-                    MERGE (cr:Crime {id: $id})
+                    MERGE (cr:Crime {name: $name})
                     SET cr.type        = $type,
                         cr.description = $description,
                         cr.motive      = $motive,
                         cr.story_title = $story_title
                     """,
                     {
-                        "id": crime_id,
+                        "name": crime_name,
                         "type": crime.get("type", "other"),
                         "description": crime.get("description", ""),
                         "motive": crime.get("motive", ""),
@@ -212,7 +217,7 @@ class Neo4jManager:
                     },
                 )
             except Exception as exc:
-                logger.error("Error almacenando Crime %s: %s", crime_id, exc)
+                logger.error("Error almacenando Crime '%s': %s", crime_name, exc)
 
         # Objects MERGE por nombre (pueden compartirse entre relatos)
         for obj in entities.get("objects", []):

@@ -108,8 +108,19 @@ def _normalize(title: str) -> str:
 
 
 def _strip_numeral_prefix(raw: str) -> str:
-    """Elimina prefijos de numeral romano del título (p. ej. 'I. ', 'ADVENTURE II. ')."""
-    return re.sub(r'^(?:(?:ADVENTURE|STORY)\s+)?[IVXLC]+\.\s+', '', raw.strip()).strip()
+    """Elimina prefijos de numeral romano y normaliza a Title Case.
+
+    Gutenberg publica algunos volúmenes con títulos en ALL CAPS y otros en
+    Title Case. Aplicar .title() al final garantiza un formato uniforme
+    independientemente de la colección de origen.
+
+    Ejemplos:
+        'I. A SCANDAL IN BOHEMIA'  -> 'A Scandal In Bohemia'
+        'ADVENTURE II. THE RED-HEADED LEAGUE' -> 'The Red-Headed League'
+        'I. Silver Blaze'          -> 'Silver Blaze'
+    """
+    stripped = re.sub(r'^(?:(?:ADVENTURE|STORY)\s+)?[IVXLC]+\.\s+', '', raw.strip()).strip()
+    return stripped.title()
 
 
 class TextProcessor:
