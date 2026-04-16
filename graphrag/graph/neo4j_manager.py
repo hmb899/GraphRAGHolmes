@@ -16,6 +16,33 @@ def _sanitize_id(text: str) -> str:
     return re.sub(r'[^a-z0-9]', '_', text.lower())
 
 
+def _title_tokens(title: str) -> set[str]:
+    """Tokens normalizados de un título, sin puntuación."""
+    return {t for t in re.sub(r"[^a-z0-9\s]", "", title.lower()).split() if t}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _fuzzy_match(query: str, candidates: set[str], threshold: float = 0.35) -> str | None:
+    """Devuelve el candidato con mayor similitud Jaccard, o None si no supera el umbral."""
+    q_tokens = _title_tokens(query)
+    best_score, best = 0.0, None
+    for c in candidates:
+        score = _jaccard(q_tokens, _title_tokens(c))
+        if score > best_score:
+            best_score, best = score, c
+    return best if best_score >= threshold else None
+
+
+# Tipos de relación que usan Scene o Event como extremo (candidatos a fuzzy match).
+_SCENE_REL_TYPES = {"PRESENT_IN", "TAKES_PLACE_IN", "FOLLOWS"}
+_EVENT_REL_TYPES = {"PARTICIPATES_IN"}
+
+
 # Tipos de relación que requieren nodos de cada etiqueta concreta.
 _REL_SPECS: dict[str, tuple[str, str, str, str]] = {
     "APPEARS_IN":     ("Character", "Story",     "name", "title"),
@@ -308,8 +335,49 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Event %s: %s", event_id, exc)
 
-    def store_relationships(self, relationships: list[dict]) -> None:
-        """Crea las relaciones entre entidades en Neo4j."""
+    def store_relationships(
+        self, relationships: list[dict], story_title: str = ""
+    ) -> None:
+        """Crea las relaciones entre entidades en Neo4j.
+
+        Args:
+            relationships: Lista de relaciones extraídas.
+            story_title: Título del relato, usado para acotar el fuzzy matching
+                         de escenas y eventos al relato correcto.
+        """
+        # Pre-cargar títulos de Scene y Event del relato para fuzzy matching.
+        # Acotar por story_title evita que una escena de otro relato con nombre
+        # similar absorba la relación equivocada.
+        has_scene_rels = any(r.get("relationship_type") in _SCENE_REL_TYPES for r in relationships)
+        has_event_rels = any(r.get("relationship_type") in _EVENT_REL_TYPES for r in relationships)
+
+        scene_titles: set[str] = set()
+        event_names: set[str] = set()
+
+        if has_scene_rels:
+            query = (
+                "MATCH (s:Scene)-[:BELONGS_TO]->(:Story {title: $t}) RETURN s.title AS title"
+                if story_title else
+                "MATCH (s:Scene) WHERE s.title IS NOT NULL RETURN s.title AS title"
+            )
+            scene_titles = {
+                row["title"]
+                for row in self.execute_query(query, {"t": story_title} if story_title else {})
+                if row["title"]
+            }
+
+        if has_event_rels:
+            query = (
+                "MATCH (e:Event {story_title: $t}) WHERE e.name IS NOT NULL RETURN e.name AS name"
+                if story_title else
+                "MATCH (e:Event) WHERE e.name IS NOT NULL RETURN e.name AS name"
+            )
+            event_names = {
+                row["name"]
+                for row in self.execute_query(query, {"t": story_title} if story_title else {})
+                if row["name"]
+            }
+
         for rel in relationships:
             rel_type = rel.get("relationship_type", "")
             source = rel.get("source_name", "")
@@ -322,6 +390,27 @@ class Neo4jManager:
                 continue
 
             src_label, tgt_label, src_key, tgt_key = spec
+
+            # Fuzzy matching para Scene
+            if rel_type in _SCENE_REL_TYPES and scene_titles:
+                if src_label == "Scene" and src_key == "title":
+                    matched = _fuzzy_match(source, scene_titles)
+                    if matched and matched != source:
+                        logger.debug("Fuzzy Scene src: %r -> %r", source, matched)
+                        source = matched
+                if tgt_label == "Scene" and tgt_key == "title":
+                    matched = _fuzzy_match(target, scene_titles)
+                    if matched and matched != target:
+                        logger.debug("Fuzzy Scene tgt: %r -> %r", target, matched)
+                        target = matched
+
+            # Fuzzy matching para Event
+            if rel_type in _EVENT_REL_TYPES and event_names:
+                if tgt_label == "Event" and tgt_key == "name":
+                    matched = _fuzzy_match(target, event_names)
+                    if matched and matched != target:
+                        logger.debug("Fuzzy Event tgt: %r -> %r", target, matched)
+                        target = matched
 
             query = f"""
             MATCH (a:{src_label} {{{src_key}: $source}})
@@ -336,7 +425,7 @@ class Neo4jManager:
                 )
             except Exception as exc:
                 logger.error(
-                    "Error creando relación %s (%s → %s): %s",
+                    "Error creando relación %s (%s -> %s): %s",
                     rel_type, source, target, exc,
                 )
 
