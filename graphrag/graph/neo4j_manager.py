@@ -42,6 +42,7 @@ def _fuzzy_match(query: str, candidates: set[str], threshold: float = 0.35) -> s
 _SCENE_REL_TYPES = {"PRESENT_IN", "TAKES_PLACE_IN", "FOLLOWS"}
 _EVENT_REL_TYPES = {"PARTICIPATES_IN"}
 _LOCATION_REL_TYPES = {"FOUND_AT", "LIVES_AT", "OCCURS_IN", "TAKES_PLACE_IN"}
+_DEDUCTION_REL_TYPES = {"LEADS_TO"}
 
 
 # Tipos de relación que requieren nodos de cada etiqueta concreta.
@@ -55,7 +56,7 @@ _REL_SPECS: dict[str, tuple[str, str, str, str]] = {
     "PRESENT_IN":     ("Character", "Scene",     "name", "title"),
     "TAKES_PLACE_IN": ("Scene",     "Location",  "title", "name"),
     "FOLLOWS":        ("Scene",     "Scene",     "title", "title"),
-    "BASED_ON":       ("Deduction", "Object",    "observation", "name"),
+    # BASED_ON se maneja con query especial en store_relationships (multi-etiqueta)
     "LEADS_TO":       ("Deduction", "Deduction", "observation", "observation"),
     "PARTICIPATES_IN":("Character", "Event",     "name", "name"),
     "OCCURS_IN":      ("Crime",     "Location",  "name", "name"),
@@ -352,10 +353,12 @@ class Neo4jManager:
         has_scene_rels = any(r.get("relationship_type") in _SCENE_REL_TYPES for r in relationships)
         has_event_rels = any(r.get("relationship_type") in _EVENT_REL_TYPES for r in relationships)
         has_location_rels = any(r.get("relationship_type") in _LOCATION_REL_TYPES for r in relationships)
+        has_deduction_rels = any(r.get("relationship_type") in _DEDUCTION_REL_TYPES for r in relationships)
 
         scene_titles: set[str] = set()
         event_names: set[str] = set()
         location_names: set[str] = set()
+        deduction_obs: set[str] = set()
 
         if has_location_rels:
             location_names = {
@@ -390,11 +393,45 @@ class Neo4jManager:
                 if row["name"]
             }
 
+        if has_deduction_rels and story_title:
+            deduction_obs = {
+                row["obs"]
+                for row in self.execute_query(
+                    "MATCH (d:Deduction {story_title: $t}) WHERE d.observation IS NOT NULL "
+                    "RETURN d.observation AS obs",
+                    {"t": story_title},
+                )
+                if row["obs"]
+            }
+
         for rel in relationships:
             rel_type = rel.get("relationship_type", "")
             source = rel.get("source_name", "")
             target = rel.get("target_name", "")
             props = rel.get("properties", {})
+
+            # BASED_ON: Deduction → Object | Event | Character | Crime | Location
+            # Se maneja con query multi-etiqueta porque el LLM enlaza deducciones
+            # con cualquier tipo de entidad, no solo Object.
+            if rel_type == "BASED_ON":
+                try:
+                    self.execute_query(
+                        """
+                        MATCH (a:Deduction {observation: $source})
+                        MATCH (b)
+                        WHERE (b:Object OR b:Event OR b:Character OR b:Crime OR b:Location)
+                          AND b.name = $target
+                        MERGE (a)-[r:BASED_ON]->(b)
+                        SET r += $props
+                        """,
+                        {"source": source, "target": target, "props": props},
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Error creando relación BASED_ON (%s -> %s): %s",
+                        source, target, exc,
+                    )
+                continue
 
             spec = _REL_SPECS.get(rel_type)
             if spec is None:
@@ -430,6 +467,16 @@ class Neo4jManager:
                     matched = _fuzzy_match(target, location_names, threshold=0.55)
                     if matched and matched != target:
                         logger.debug("Fuzzy Location tgt: %r -> %r", target, matched)
+                        target = matched
+
+            # Fuzzy matching para Deduction (LEADS_TO target).
+            # El LLM a veces parafrasea la observación destino en lugar de copiarla
+            # exactamente, lo que impide el MATCH por texto exacto.
+            if rel_type in _DEDUCTION_REL_TYPES and deduction_obs:
+                if tgt_key == "observation":
+                    matched = _fuzzy_match(target, deduction_obs, threshold=0.40)
+                    if matched and matched != target:
+                        logger.debug("Fuzzy Deduction tgt: %r -> %r", target, matched)
                         target = matched
 
             query = f"""

@@ -14,7 +14,8 @@ build/
 # Data (se regenera con el pipeline)
 data/*.txt
 data/*.json
-output/
+output/*
+!output/extraction_results.json
 
 # Jupyter
 .ipynb_checkpoints/

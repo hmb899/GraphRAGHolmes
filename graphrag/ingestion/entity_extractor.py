@@ -898,12 +898,26 @@ Only extract relationships that are explicitly supported by the text. Include th
         chunk_entities: list[dict] = []
         total = len(chunks)
 
+        failed_chunks = 0
+
         for i, chunk in enumerate(tqdm(chunks, desc=f"Extrayendo '{story_title}'")):
             chunk_text = chunk["text"]
             logger.info("Procesando chunk %d/%d de '%s'", i + 1, total, story_title)
 
             # entidades
             entities = self.extract_entities(chunk_text, context, story_title)
+
+            # Detectar chunks vacíos (posibles fallos de API silenciosos)
+            if not any([
+                entities.characters, entities.locations, entities.crimes,
+                entities.objects, entities.deductions, entities.scenes, entities.events,
+            ]):
+                failed_chunks += 1
+                logger.warning(
+                    "Chunk %d/%d de '%s' devolvió resultado vacío.",
+                    i + 1, total, story_title,
+                )
+
             all_entity_results.append(entities)
 
             # recoge nombres de entidades de este chunk para MENTIONS
@@ -928,6 +942,18 @@ Only extract relationships that are explicitly supported by the text. Include th
                 logger.warning(
                     "Error actualizando contexto en chunk %d/%d: %s", i + 1, total, exc
                 )
+
+        # Validación post-extracción: advertir si demasiados chunks fallaron
+        if failed_chunks > 0:
+            ratio = failed_chunks / total
+            msg = (
+                f"'{story_title}': {failed_chunks}/{total} chunks sin entidades ({ratio:.0%}). "
+                "Posibles fallos de API."
+            )
+            if ratio > 0.30:
+                logger.warning("⚠️  %s — considera re-extraer este relato.", msg)
+            else:
+                logger.warning(msg)
 
         # Entity resolution
         logger.info("Iniciando entity resolution para '%s' (%d chunks)...", story_title, total)
