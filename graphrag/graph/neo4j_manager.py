@@ -540,9 +540,7 @@ class Neo4jManager:
         )
         return {row["label"]: row["count"] for row in rows if row["label"]}
 
-    # ------------------------------------------------------------------
     # Schema (clase a cambiar)
-    # ------------------------------------------------------------------
 
     def get_schema(self) -> dict[str, Any]:
         """Obtiene el esquema del grafo (nodos, propiedades y relaciones)."""

@@ -951,7 +951,7 @@ Only extract relationships that are explicitly supported by the text. Include th
                 "Posibles fallos de API."
             )
             if ratio > 0.30:
-                logger.warning("⚠️  %s — considera re-extraer este relato.", msg)
+                logger.warning(" %s — considera re-extraer este relato.", msg)
             else:
                 logger.warning(msg)
 
