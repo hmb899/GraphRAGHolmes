@@ -104,7 +104,7 @@ def test_pydantic_models():
     loc = LocationEntity(name="221B Baker Street", type="building")
     assert loc.type == "building"
 
-    crime = CrimeEntity(type="murder", description="The victim was found dead.")
+    crime = CrimeEntity(name="Murder of the victim", type="murder", description="The victim was found dead.")
     assert crime.type == "murder"
 
     deduction = DeductionEntity(

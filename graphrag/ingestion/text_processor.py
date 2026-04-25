@@ -44,30 +44,22 @@ GUTENBERG_COLLECTIONS = {
 }
 
 PHASE1_STORIES = [
-    "A Scandal in Bohemia",
-    "The Red-Headed League",
     "The Adventure of the Speckled Band",
-    "The Five Orange Pips",
-    "The Adventure of the Blue Carbuncle",
-    "A Case of Identity",
-    "The Adventure of the Copper Beeches",
+    "The Red-Headed League",
+    "A Scandal in Bohemia",
     "Silver Blaze",
-    "The Adventure of the Dancing Men",
     "The Final Problem",
+    "The Adventure of the Dancing Men",
 ]
 
 # Colección de origen de cada relato de la Fase 1
 _STORY_COLLECTION_MAP: dict[str, str] = {
-    "a scandal in bohemia": "adventures",
-    "the red-headed league": "adventures",
     "the adventure of the speckled band": "adventures",
-    "the five orange pips": "adventures",
-    "the adventure of the blue carbuncle": "adventures",
-    "a case of identity": "adventures",
-    "the adventure of the copper beeches": "adventures",
+    "the red-headed league": "adventures",
+    "a scandal in bohemia": "adventures",
     "silver blaze": "memoirs",
-    "the adventure of the dancing men": "return",
     "the final problem": "memoirs",
+    "the adventure of the dancing men": "return",
 }
 
 # Detecta cabeceras de relato en tres formatos de Gutenberg:
@@ -76,6 +68,8 @@ _STORY_COLLECTION_MAP: dict[str, str] = {
 #   3. ALL CAPS sin numeral        →  "THE ADVENTURE OF THE..."   (return)
 # IMPORTANTE: usar ' ' en vez de '\s' en los character classes para no cruzar
 # líneas en blanco y capturar solo el título de esa línea.
+# Los apóstrofes tipográficos (U+2019) se normalizan a ASCII en
+# clean_gutenberg_text() antes de aplicar este regex.
 _HEADER_RE = re.compile(
     r'\n\n'
     r'('
@@ -200,6 +194,9 @@ class TextProcessor:
             logger.warning("Marcador de fin de Gutenberg no encontrado.")
 
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Normalizar comillas tipográficas a ASCII para que el regex de cabeceras funcione
+        text = text.replace("’", "'").replace("‘", "'")
+        text = text.replace("“", '"').replace("”", '"')
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
@@ -359,6 +356,28 @@ class TextProcessor:
             len(results),
             len(PHASE1_STORIES),
         )
+        return results
+
+    def process_stories(self, titles: list[str]) -> dict[str, list[dict]]:
+        """Descarga y procesa una lista arbitraria de relatos por título.
+
+        Args:
+            titles: Lista de títulos en cualquier capitalización
+                    (ej. ["The Adventure of the Speckled Band"]).
+
+        Returns:
+            Dict {story_title: [chunks]} para cada relato procesado.
+        """
+        logger.info("Pipeline personalizado: %d relatos", len(titles))
+        targets = {_normalize(t) for t in titles}
+        results = self._run_pipeline(target_titles=targets)
+
+        found_norm = {_normalize(t) for t in results}
+        missing = [t for t in titles if _normalize(t) not in found_norm]
+        if missing:
+            logger.warning("Relatos no encontrados: %s", missing)
+
+        logger.info("Completado: %d/%d relatos procesados.", len(results), len(titles))
         return results
 
     def process_all(self) -> dict[str, list[dict]]:

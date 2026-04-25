@@ -167,6 +167,10 @@ class NarrativeContext(BaseModel):
         default="",
         description="Resumen narrativo de 2-3 frases del contexto hasta este punto",
     )
+    known_crime_names: list[str] = Field(
+        default_factory=list,
+        description="Nombres exactos de crímenes ya nombrados en chunks anteriores",
+    )
 
 
 
@@ -181,7 +185,8 @@ def _normalize_name(name: str) -> str:
 # Títulos y honoríficos que no forman parte del nombre propio
 _TITLE_PREFIXES: frozenset[str] = frozenset({
     "mr", "mrs", "ms", "miss", "mister", "mistress", "dr", "doctor",
-    "colonel", "col", "major", "captain", "capt", "inspector",
+    "colonel", "col", "major", "major-general", "general", "captain", "capt",
+    "lieutenant", "admiral", "sergeant", "inspector",
     "professor", "prof", "sir", "lady", "lord",
     "young", "old", "the", "a", "an", "née", "esq",
 })
@@ -285,10 +290,26 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
     #     "Mrs. Henry Baker" ≠ "Mr. Henry Baker"
     tokens_a = _normalize_name(name_a).replace(",", "").replace(".", "").split()
     tokens_b = _normalize_name(name_b).replace(",", "").replace(".", "").split()
-    mrs_a = bool(tokens_a) and tokens_a[0] == "mrs"
-    mrs_b = bool(tokens_b) and tokens_b[0] == "mrs"
+    title_a = tokens_a[0] if tokens_a else ""
+    title_b = tokens_b[0] if tokens_b else ""
+
+    mrs_a = title_a == "mrs"
+    mrs_b = title_b == "mrs"
     if mrs_a != mrs_b:
         return False
+
+    # Título femenino personal (Miss/Ms) no puede coincidir con un nombre que
+    # tenga título profesional/masculino (Dr/Mr/Sir...) Y además nombre de pila.
+    # Evita que "Miss Roylott" (alias de Helen Stoner) se fusione con
+    # "Dr. Grimesby Roylott" por compartir el apellido.
+    _FEMALE_PERSONAL = {"miss", "ms"}
+    _MALE_OR_PROFESSIONAL = {"dr", "mr", "mister", "sir", "lord", "professor", "prof"}
+    if title_a in _FEMALE_PERSONAL and title_b in _MALE_OR_PROFESSIONAL:
+        if len(b.split()) >= 2:  # b tiene nombre de pila → persona distinta
+            return False
+    if title_b in _FEMALE_PERSONAL and title_a in _MALE_OR_PROFESSIONAL:
+        if len(a.split()) >= 2:
+            return False
 
     # 1. Igualdad exacta tras strip de títulos
     if a == b:
@@ -310,15 +331,30 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
     #    'king' prefix de 'king of bohemia'.
     #    Se excluye el substring arbitrario para evitar falsos positivos como
     #    'norton' (substring de 'irene norton adler' pero NO suffix).
+    #
+    # Guard: rangos militares stripped a un único token (apellido) no deben
+    # fusionarse por suffix con nombres que tienen nombre de pila, porque
+    # podrían ser parientes distintos (ej. "Major-General Stoner" ≠ "Helen Stoner").
+    # Los apellidos desnudos (sin rango, ej. "Holmes") sí pueden hacer suffix.
+    _MILITARY_RANKS: frozenset[str] = frozenset({
+        "major-general", "general", "colonel", "admiral", "lieutenant",
+    })
+    a_mil_single = len(a.split()) == 1 and title_a in _MILITARY_RANKS
+    b_mil_single = len(b.split()) == 1 and title_b in _MILITARY_RANKS
+
     if _is_word_suffix(a, b) or _is_word_suffix(b, a):
+        if (a_mil_single and len(b.split()) >= 2) or (b_mil_single and len(a.split()) >= 2):
+            return False
         return True
     if _is_word_prefix(a, b) or _is_word_prefix(b, a):
+        if (a_mil_single and len(b.split()) >= 2) or (b_mil_single and len(a.split()) >= 2):
+            return False
         return True
 
     return False
 
 
-def _merge_entity_group(group: list, name_attr: str = "name") -> object:
+def _merge_entity_group(group: list, name_attr: str = "name", prefer_proper_name: bool = False) -> object:
     """Fusiona un grupo de entidades en una sola instancia.
 
     Elige el nombre canónico más completo, combina
@@ -327,6 +363,9 @@ def _merge_entity_group(group: list, name_attr: str = "name") -> object:
     Args:
         group: Lista de instancias de entidad del mismo tipo.
         name_attr: Nombre del atributo que actúa como identificador principal.
+        prefer_proper_name: Si True (Characters), elige el canónico con más
+            tokens de nombre real tras quitar títulos. Evita que rangos
+            militares como "Major-General Stoner" ganen a "Helen Stoner".
 
     Returns:
         Una única instancia de entidad fusionada.
@@ -334,8 +373,17 @@ def _merge_entity_group(group: list, name_attr: str = "name") -> object:
     if len(group) == 1:
         return group[0]
 
-    # Nombre canónico = la variante más larga
-    canonical = max(group, key=lambda e: len(getattr(e, name_attr, "")))
+    if prefer_proper_name:
+        def _proper_name_score(name: str) -> tuple:
+            stripped = _strip_titles(name)
+            n_tokens = len(stripped.split()) if stripped else 0
+            # Primero: más tokens de nombre real; luego: nombre stripped más largo;
+            # luego: nombre original más corto (menos honoríficos superfluos)
+            return (n_tokens, len(stripped), -len(name))
+        canonical = max(group, key=lambda e: _proper_name_score(getattr(e, name_attr, "")))
+    else:
+        # Nombre canónico = la variante más larga
+        canonical = max(group, key=lambda e: len(getattr(e, name_attr, "")))
 
     updates: dict = {}
 
@@ -485,12 +533,21 @@ class EntityExtractor:
         # Mantener los 3 eventos más recientes del contexto anterior + los nuevos
         recent = (current_context.recent_events + events)[-5:]
 
+        # Acumular nombres de crímenes ya asignados (evita que cada chunk invente uno nuevo).
+        # Cap en 3 para que los crímenes de fondo extraídos en chunks tempranos no
+        # desplacen al crimen central cuando aparezca.
+        new_crime_names = [c.name for c in extracted_entities.crimes]
+        known_crimes = list(dict.fromkeys(
+            current_context.known_crime_names + new_crime_names
+        ))[:3]
+
         return NarrativeContext(
             current_location=locs[0] if locs else current_context.current_location,
             characters_present=chars if chars else current_context.characters_present,
             recent_events=recent,
             active_investigation=crimes[0] if crimes else current_context.active_investigation,
             unresolved_references=[],
+            known_crime_names=known_crimes,
         )
 
 
@@ -517,17 +574,27 @@ class EntityExtractor:
             Devuelve un resultado vacío si el LLM falla.
         """
         context_section = ""
-        if context and context.summary:
+        if context:
             present = (
                 ", ".join(context.characters_present)
                 if context.characters_present
                 else "unknown"
             )
-            context_section = (
-                f"NARRATIVE CONTEXT SO FAR:\n{context.summary}\n"
-                f"Characters present: {present}\n"
-                f"Current location: {context.current_location}\n\n"
-            )
+            crimes_line = ""
+            if context.known_crime_names:
+                crimes_line = (
+                    f"Crimes already named (use EXACTLY these names if the same crime "
+                    f"reappears — do NOT rename them): "
+                    + ", ".join(f'"{n}"' for n in context.known_crime_names)
+                    + "\n"
+                )
+            if context.summary or context.known_crime_names:
+                context_section = (
+                    f"NARRATIVE CONTEXT SO FAR:\n{context.summary}\n"
+                    f"Characters present: {present}\n"
+                    f"Current location: {context.current_location}\n"
+                    f"{crimes_line}\n"
+                )
 
         prompt = f"""You are an expert literary analyst specializing in the Sherlock Holmes canon by Arthur Conan Doyle.
 
@@ -537,11 +604,11 @@ Extract all entities from the following text fragment of the story "{story_title
 {chunk_text}
 
 Extract:
-- Characters: named persons with their occupation and role. Extract the name EXACTLY as it appears in this fragment (e.g. "Holmes", or "Mr. Sherlock Holmes", or "Dr. Watson" — whichever form is used here). Each character gets one entry per fragment; do not list other characters as part of this entry.
+- Characters: ONLY persons with a proper name or title+surname (e.g. "Holmes", "Mr. Sherlock Holmes", "Dr. Watson", "Miss Stoner", "Percy Armitage"). Extract the name EXACTLY as it appears in this fragment. Do NOT extract unnamed characters referred to only by role, description, or relationship (e.g. do NOT extract "young lady", "huge man", "housekeeper", "sister", "old doctor", "local blacksmith", "band of gipsies", "madam"). Each character gets one entry per fragment.
 - Locations: named places with their type (city/building/street/region/country)
-- Crimes: ONLY the single central crime or mystery that THIS fragment is about (1 maximum, 2 only if two truly distinct crimes are both central to this fragment). STRICT RULES: (a) do NOT extract suspicions, fears, or vague threats — only actual committed crimes or the story's core mystery; (b) do NOT extract the same crime with a different wording than a previous chunk — if the crime was already named in context, use that exact name; (c) do NOT extract background crimes, past crimes referenced in passing, or hypothetical crimes. Give each crime a short, unique, descriptive name (e.g. "Murder of John Straker", "Theft of the Blue Carbuncle", "Disappearance of Silver Blaze").
+- Crimes: ONLY crimes that Holmes was hired to investigate. There are at most 2: the original mystery (what the client reported) and an ongoing threat to the client. RULES: (a) The central crime = what the CLIENT described when asking for help — extract it immediately even if it happened years ago (e.g. "Murder of Julia Stoner"). (b) If already named in context, use that EXACT name. (c) Do NOT extract a character's past criminal history that merely establishes their dangerous nature (e.g. beating a butler years ago = character background, not a crime to extract). (d) Do NOT extract deaths or crimes that happen TO the antagonist/criminal during the investigation — these are plot resolutions, not the crimes Holmes was hired to solve (e.g. if the villain dies at the end, that is NOT a crime to extract). (e) Do NOT extract suspicions, fears, or mental states. Name format: "Murder/Attempted Murder/Theft/Disappearance of [Victim]" — never use vague adjectives or literary quotes.
 - Objects: ONLY objects that are clues, weapons, or pivotal to the plot. Ignore generic furniture, clothing, and incidental items.
-- Deductions: reasoning chains by Holmes (observation → inference → conclusion)
+- Deductions: EVERY step in Holmes's reasoning process. If Holmes makes a multi-step deduction (observation A → inference B → conclusion C), extract EACH step as a separate Deduction entry. Be thorough — extract ALL observations, inferences and conclusions, not just the final one. A typical Holmes investigation should yield 4-8 deductions per story.
 - Scenes: narrative units (a scene changes when location, time, or present characters change significantly)
 - Events: key plot events
 
@@ -626,10 +693,13 @@ Extract relationships between these entities. Valid relationship types (ONLY the
 - TAKES_PLACE_IN: Scene → Location  ← source_name = EXACT scene title from the list above (NOT "LOCATED_IN")
 - FOLLOWS: Scene → Scene  ← both source_name and target_name = EXACT scene titles from the list above
 - BASED_ON: Deduction → Object or Event  (source_name = the EXACT observation text of the deduction, as listed above)
-- LEADS_TO: Deduction → Deduction  (source_name and target_name = the EXACT observation text of each deduction)
+- LEADS_TO: Deduction → Deduction  (source_name and target_name = the EXACT observation text of each deduction). IMPORTANT: if this chunk contains multiple deductions that form a logical chain (one observation leads Holmes to the next), you MUST connect them with LEADS_TO. A chain of 3 deductions should have 2 LEADS_TO relations. Do not leave deductions unconnected if they clearly follow from each other.
 - PARTICIPATES_IN: Character → Event  ← source_name = EXACT character name, target_name = EXACT event name from the list above
 
 CRITICAL NAMING RULES — failure to follow these will break the knowledge graph:
+- For ALL relationships involving Characters, Locations, Crimes, Scenes, and Events: source_name and target_name MUST be taken verbatim from the ENTITIES FOUND list above. Do NOT use pronouns (he/she/they/him/her), possessives (my stepfather, her sister, his colleague), generic roles (the doctor, the landlord, the stranger), or any name not explicitly listed above. If the real name is not in the list, skip the relationship entirely.
+- For KNOWS: both source_name and target_name must be character names from the "Characters:" list above. Never use a pronoun or description as either endpoint.
+- For LEADS_TO and BASED_ON: source_name and target_name are the observation texts of deductions (these are long phrases). Copy them as accurately as possible from the "Deductions" list above — an approximate match is acceptable for these.
 - For PRESENT_IN, TAKES_PLACE_IN, FOLLOWS: use ONLY scene titles that appear verbatim in the "Scenes:" list above. Do NOT paraphrase, shorten, or invent new scene titles.
 - For PARTICIPATES_IN: use ONLY event names that appear verbatim in the "Events:" list above. Do NOT paraphrase, shorten, or invent new event names.
 - For INVESTIGATES and OCCURS_IN: use ONLY crime names that appear verbatim in the "Crimes:" list above. Do NOT use the crime type ("murder", "theft", etc.) — use the full crime name.
@@ -717,7 +787,8 @@ Only extract relationships that are explicitly supported by the text. Include th
             key = _normalize_name(getattr(entity, name_attr, ""))
             groups.setdefault(key, []).append(entity)
 
-        merged = [_merge_entity_group(g, name_attr) for g in groups.values()]
+        is_character = entity_type == "Character"
+        merged = [_merge_entity_group(g, name_attr, prefer_proper_name=is_character) for g in groups.values()]
 
         if len(merged) <= 1:
             return merged
@@ -762,15 +833,25 @@ Only extract relationships that are explicitly supported by the text. Include th
             rule_merged_pairs: set[tuple[int, int]] = set()
             llm_candidates: list[tuple[int, int]] = []
 
+            # Para crímenes usamos un umbral más alto: nombres como
+            # "Death of Julia" y "Death of Dr. Roylott" tienen similitud
+            # semántica alta (~0.90) pero son crímenes completamente distintos.
+            merge_threshold = (
+                0.97 if entity_type == "Crime" else self._MERGE_THRESHOLD
+            )
+            ambiguous_threshold = (
+                0.95 if entity_type == "Crime" else self._AMBIGUOUS_THRESHOLD
+            )
+
             for i in range(len(merged)):
                 for j in range(i + 1, len(merged)):
                     if (i, j) in already_merged:
                         continue
                     sim = cosine_similarity(embeddings[i], embeddings[j])
-                    if sim > self._MERGE_THRESHOLD:
+                    if sim > merge_threshold:
                         to_merge.append((i, j))
                         rule_merged_pairs.add((i, j))
-                    elif sim > self._AMBIGUOUS_THRESHOLD:
+                    elif sim > ambiguous_threshold:
                         llm_candidates.append((i, j))
 
             # LLM para zona gris (solo entidades no-personaje)
@@ -792,16 +873,36 @@ Only extract relationships that are explicitly supported by the text. Include th
                 x = parent[x]
             return x
 
+        def _first_names_in_group(root: int) -> set[str]:
+            """Nombres de pila (primer token tras strip) de los miembros del grupo."""
+            result = set()
+            for idx in range(len(merged)):
+                if _find(idx) == root:
+                    name = getattr(merged[idx], name_attr, "")
+                    stripped = _strip_titles(name).split()
+                    if len(stripped) >= 2:
+                        result.add(stripped[0])
+            return result
+
         for i, j in to_merge:
             ri, rj = _find(i), _find(j)
             if ri != rj:
+                # Para Characters: no fusionar si el grupo resultante tendría
+                # dos primeros nombres distintos (ej. "Helen" y "Julia" son
+                # personas distintas aunque compartan el apellido "Stoner").
+                if is_character:
+                    fn_i = _first_names_in_group(ri)
+                    fn_j = _first_names_in_group(rj)
+                    combined = fn_i | fn_j
+                    if len(combined) >= 2:
+                        continue  # conflicto de nombre de pila → no fusionar
                 parent[rj] = ri
 
         root_to_group: dict[int, list] = {}
         for idx, entity in enumerate(merged):
             root_to_group.setdefault(_find(idx), []).append(entity)
 
-        return [_merge_entity_group(g, name_attr) for g in root_to_group.values()]
+        return [_merge_entity_group(g, name_attr, prefer_proper_name=is_character) for g in root_to_group.values()]
 
     def resolve_entities(
         self,
@@ -836,16 +937,30 @@ Only extract relationships that are explicitly supported by the text. Include th
             "the ", "a ", "an ",              # artículos: "the lad", "a rough"
             "my ", "your ", "his ", "her ",   # posesivos: "my uncle Elias", "her lawyer"
             "our ", "this ", "that ",         # otros determinantes
+            # Adjetivos descriptivos sin nombre propio a continuación
+            "young ", "old ", "elderly ", "huge ", "large ", "little ",
+            "local ", "native ", "poor ", "wandering ", "half-pay ",
         )
         _GENERIC_EXACT: frozenset[str] = frozenset({
             # Pronombres
             "i", "we", "he", "she", "they", "you", "it",
-            "him", "her", "them", "us", "me",
+            "him", "her", "them", "us", "me", "myself",
             # Roles sueltos sin artículo ni nombre propio
             "doctor", "inspector", "narrator", "gentleman",
             "companion", "stranger", "visitor", "assistant",
             "husband", "wife", "maid", "porter", "lad",
             "coachman", "landlord", "landlady",
+            # Parentesco
+            "sister", "brother", "aunt", "uncle", "cousin",
+            "mother", "father", "daughter", "son", "widow",
+            # Oficios / roles sin nombre
+            "housekeeper", "butler", "footman", "driver", "guard",
+            "blacksmith", "carpenter", "gardener", "gamekeeper",
+            "groom", "cook", "nurse", "clerk", "constable",
+            # Formas de tratamiento genéricas
+            "madam", "madame",
+            # Colectivos
+            "band", "crowd", "gang", "mob",
         })
 
         def _is_generic(name: str) -> bool:
@@ -857,6 +972,35 @@ Only extract relationships that are explicitly supported by the text. Include th
             if not _is_generic(c.name)
             and len(_normalize_name(c.name)) > 1
         ]
+
+        # Filtrar locaciones puramente posicionales/genéricas sin nombre propio.
+        # Ejemplos a descartar: "the room", "corridor", "second chamber", "your room".
+        # Ejemplos a conservar: "Stoke Moran Manor House", "Dr. Roylott's chamber".
+        _GENERIC_LOC_WORDS: frozenset[str] = frozenset({
+            "room", "rooms", "corridor", "chamber", "chambers", "bedroom",
+            "hall", "hallway", "passage", "passageway", "landing", "staircase",
+            "stairs", "stair", "floor", "wing", "block", "building", "buildings",
+            "door", "window", "wall", "ceiling", "roof", "garden", "lawn",
+            "courtyard", "yard", "grounds", "area", "space", "place", "spot",
+            "interior", "exterior", "outside", "inside",
+        })
+        _LOC_PREFIXES_GENERIC: tuple[str, ...] = (
+            "the ", "a ", "an ", "your ", "my ", "his ", "her ", "our ",
+            "this ", "that ", "some ", "another ", "next ", "other ",
+        )
+
+        def _is_generic_location(name: str) -> bool:
+            import re
+            n = _normalize_name(name)
+            # Quitar prefijos genéricos
+            for p in _LOC_PREFIXES_GENERIC:
+                if n.startswith(p):
+                    n = n[len(p):]
+            # Si tras quitar prefijos el nombre es solo palabras genéricas → descartar
+            tokens = re.sub(r"[^a-z0-9\s]", "", n).split()
+            return bool(tokens) and all(t in _GENERIC_LOC_WORDS for t in tokens)
+
+        locations = [l for l in locations if not _is_generic_location(l.name)]
 
         logger.info(
             "Entity resolution: %d chars, %d locs, %d objects, %d scenes, %d events",
@@ -975,14 +1119,91 @@ Only extract relationships that are explicitly supported by the text. Include th
             | {e["name"] for e in consolidated.model_dump().get("events", [])}
             | {d["observation"] for d in consolidated.model_dump().get("deductions", [])}
         )
+        # Tipos de relación donde AMBOS extremos deben ser entidades conocidas
+        _BOTH_MUST_EXIST = {"KNOWS", "INVESTIGATES", "PRESENT_IN", "PARTICIPATES_IN",
+                            "FOLLOWS"}
+        # LEADS_TO y BASED_ON usan textos largos de observación como claves.
+        # El LLM los parafrasea ligeramente, así que se usa matching por prefijo
+        # (primeros 40 chars) en vez de igualdad exacta.
+        deduction_obs = {d["observation"] for d in consolidated.model_dump().get("deductions", [])}
+        deduction_prefixes = {obs[:40].lower().strip() for obs in deduction_obs}
+
+        def _deduction_known(text: str) -> bool:
+            if text in deduction_obs:
+                return True
+            return text[:40].lower().strip() in deduction_prefixes
+
         before = len(resolved_relationships)
         resolved_relationships = [
             r for r in resolved_relationships
             if r.source_name in known_names
+            and (
+                r.relationship_type not in _BOTH_MUST_EXIST
+                or r.target_name in known_names
+            )
+            and (
+                r.relationship_type not in {"LEADS_TO", "BASED_ON"}
+                or _deduction_known(r.source_name)
+            )
         ]
         dropped = before - len(resolved_relationships)
         if dropped:
-            logger.info("Filtradas %d relaciones huerfanas (source no canónico).", dropped)
+            logger.info("Filtradas %d relaciones huerfanas (source o target no canónico).", dropped)
+
+        # Deduplicar relaciones: por cada tripleta (source, type, target) se queda
+        # una sola instancia. Cuando hay varias, se fusionan las properties eligiendo
+        # el valor más específico (para INVESTIGATES: perpetrator > victim > suspect >
+        # witness > investigator; para KNOWS: el relationship_type más frecuente).
+        _INVESTIGATES_PRIORITY = {
+            "perpetrator": 0, "victim": 1, "suspect": 2,
+            "witness": 3, "client": 4, "investigator": 5,
+        }
+
+        seen: dict[tuple, ExtractedRelationship] = {}
+        for rel in resolved_relationships:
+            key = (rel.source_name, rel.relationship_type, rel.target_name)
+            if key not in seen:
+                seen[key] = rel
+            else:
+                # Fusionar properties: para INVESTIGATES elegir role más específico
+                existing = seen[key]
+                if rel.relationship_type == "INVESTIGATES":
+                    cur_role = existing.properties.get("role", "investigator")
+                    new_role = rel.properties.get("role", "investigator")
+                    if (_INVESTIGATES_PRIORITY.get(new_role, 99)
+                            < _INVESTIGATES_PRIORITY.get(cur_role, 99)):
+                        seen[key] = rel
+
+        # KNOWS adicional: deduplicar por par no ordenado {A, B}, conservando
+        # solo una dirección con el relationship_type más específico.
+        # Esto evita tener Holmes→Watson[friend] + Watson→Holmes[friend].
+        _KNOWS_PRIORITY = {
+            "enemy": 0, "family": 1, "friend": 2, "colleague": 3,
+            "client": 4, "acquaintance": 5,
+        }
+        knows_best: dict[frozenset, ExtractedRelationship] = {}
+        non_knows: list[ExtractedRelationship] = []
+        for rel in seen.values():
+            if rel.source_name == rel.target_name:
+                continue  # self-loop
+            if rel.relationship_type != "KNOWS":
+                non_knows.append(rel)
+            else:
+                pair = frozenset({rel.source_name, rel.target_name})
+                if pair not in knows_best:
+                    knows_best[pair] = rel
+                else:
+                    existing = knows_best[pair]
+                    cur_t = existing.properties.get("relationship_type", "acquaintance")
+                    new_t = rel.properties.get("relationship_type", "acquaintance")
+                    if _KNOWS_PRIORITY.get(new_t, 99) < _KNOWS_PRIORITY.get(cur_t, 99):
+                        knows_best[pair] = rel
+
+        before_dedup = len(resolved_relationships)
+        resolved_relationships = non_knows + list(knows_best.values())
+        deduped = before_dedup - len(resolved_relationships)
+        if deduped:
+            logger.info("Deduplicadas/eliminadas %d relaciones (repetidas o self-loop).", deduped)
 
         logger.info(
             "'%s': %d entidades consolidadas, %d relaciones extraídas.",
