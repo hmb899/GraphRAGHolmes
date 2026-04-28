@@ -1,0 +1,14 @@
+question;cypher
+Hello;RETURN 'Hello! I am a knowledge assistant specialising in Sherlock Holmes stories.' AS ground_truth
+What can you do?;RETURN 'I can answer questions about Sherlock Holmes stories: characters, crimes, deductions, locations, and events.' AS ground_truth
+What is the weather like today?;RETURN 'This question is outside my scope.' AS ground_truth
+Who won the World Cup?;RETURN 'This question is outside my scope.' AS ground_truth
+How many stories are in the graph?;MATCH (s:Story) WITH count(s) AS n RETURN 'There are ' + toString(n) + ' stories in the graph.' AS ground_truth
+How many characters are in the graph?;MATCH (c:Character) WITH count(c) AS n RETURN 'There are ' + toString(n) + ' characters in the graph.' AS ground_truth
+What stories does Sherlock Holmes appear in?;MATCH (c:Character {name: 'Sherlock Holmes'})-[:APPEARS_IN]->(s:Story) RETURN s.title AS ground_truth ORDER BY s.title
+Who does Holmes know?;MATCH (c:Character {name: 'Sherlock Holmes'})-[:KNOWS]->(c2:Character) RETURN c2.name AS ground_truth ORDER BY c2.name
+What crimes does Holmes investigate?;MATCH (c:Character {name: 'Sherlock Holmes'})-[:INVESTIGATES]->(cr:Crime) RETURN cr.name AS ground_truth
+Where does Holmes live?;MATCH (c:Character {name: 'Sherlock Holmes'})-[:LIVES_AT]->(l:Location) RETURN l.name AS ground_truth
+How many locations are in the graph?;MATCH (l:Location) WITH count(l) AS n RETURN 'There are ' + toString(n) + ' locations in the graph.' AS ground_truth
+Describe Holmes' deduction method;MATCH (d:Deduction) RETURN d.method AS ground_truth LIMIT 3
+What happens at Baker Street?;MATCH (sc:Scene)-[:TAKES_PLACE_IN]->(l:Location) WHERE l.name CONTAINS 'Baker' RETURN sc.title AS ground_truth
