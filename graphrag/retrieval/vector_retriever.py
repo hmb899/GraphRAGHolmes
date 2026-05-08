@@ -1,11 +1,10 @@
-"""Recuperadores basados en búsqueda vectorial e híbrida."""
-
 import logging
 from typing import Any
 
 from ..config import get_settings
 from ..graph.neo4j_manager import Neo4jManager
 from ..llm.embedding_client import EmbeddingClient
+from ..llm.gemini_client import GeminiClient, ModelTier
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +17,12 @@ _HYDE_SYSTEM = (
 
 
 def _hyde_embed(query: str, embedding_client: EmbeddingClient) -> list[float]:
-    """HyDE: embed a hypothetical answer passage instead of the bare question.
+    """HyDE: embebe un pasaje hipotético de respuesta en lugar de la pregunta directa.
 
-    Generating a plausible answer text before embedding pulls the query vector
-    into the same semantic space as the actual story chunks, improving recall
-    for descriptive and narrative questions without re-indexing.
-    Falls back to direct query embedding if the LLM call fails.
+    Genera un texto de respuesta plausible antes de embeber para acercar el vector
+    de la query al espacio semántico de los chunks reales, mejorando el recall sin
+    re-indexar. Si el LLM falla, hace fallback al embedding directo de la query.
     """
-    from ..llm.gemini_client import GeminiClient, ModelTier
     try:
         hypothetical = GeminiClient().generate(
             prompt=f"Question: {query}\n\nPassage:",
@@ -63,26 +60,9 @@ class VectorRetriever:
         self.embedding_client = EmbeddingClient()
         self.settings = get_settings()
 
-    def retrieve(
-        self,
-        query: str,
-        top_k: int | None = None,
-        filters: dict | None = None,
-        use_hyde: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Recupera los chunks más similares a la query por búsqueda vectorial pura.
-
-        Args:
-            query: Texto de la consulta.
-            top_k: Número máximo de resultados. Por defecto settings.top_k_results.
-            filters: Filtros opcionales. Claves soportadas: 'story_title', 'collection'.
-            use_hyde: Si True, embebe un pasaje hipotético en vez de la pregunta directa
-                      (HyDE). Mejora recall en preguntas descriptivas sin re-indexar.
-
-        Returns:
-            Lista de dicts con keys: text, chunk_id, chunk_index, position,
-            story_title, collection, score.
-        """
+    def retrieve(self, query: str, top_k: int | None = None, filters: dict | None = None,
+                 use_hyde: bool = True) -> list[dict[str, Any]]:
+        """Recupera los chunks más similares a la query por búsqueda vectorial pura."""
         top_k = top_k or self.settings.top_k_results
         try:
             query_embedding = (
@@ -122,28 +102,9 @@ class VectorRetriever:
             logger.error("Error en búsqueda vectorial: %s", exc)
             return []
 
-    def retrieve_with_context(
-        self,
-        query: str,
-        top_k: int | None = None,
-        filters: dict | None = None,
-        use_hyde: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Recupera chunks enriquecidos con entidades mencionadas (Character, Location, Object).
-
-        Usa tres OPTIONAL MATCH separados con labels explícitos para evitar el
-        producto cartesiano que produce duplicados con un MATCH genérico.
-
-        Args:
-            query: Texto de la consulta.
-            top_k: Número máximo de resultados.
-            filters: Filtros opcionales. Claves soportadas: 'story_title', 'collection'.
-            use_hyde: Si True, embebe un pasaje hipotético (HyDE) en vez de la pregunta.
-
-        Returns:
-            Lista de dicts con keys: text, chunk_id, chunk_index, position,
-            story_title, collection, score, characters, locations, objects.
-        """
+    def retrieve_with_context(self, query: str, top_k: int | None = None, filters: dict | None = None,
+                              use_hyde: bool = True) -> list[dict[str, Any]]:
+        """Recupera chunks con entidades mencionadas; usa OPTIONAL MATCH separados por label para evitar producto cartesiano."""
         top_k = top_k or self.settings.top_k_results
         try:
             query_embedding = (
@@ -193,9 +154,7 @@ class VectorRetriever:
             return []
 
 
-# Subquery UNION reutilizable: combina resultados vectoriales y fulltext
-# con scores normalizados (score / max). Cadena literal para evitar conflictos
-# de escape con las llaves de los map literals de Cypher.
+# Cadena literal (no f-string) para evitar conflictos de escape con las llaves de Cypher.
 _HYBRID_UNION = """
 CALL () {
     CALL db.index.vector.queryNodes('chunk_embeddings', $top_k, $query_embedding)
@@ -227,26 +186,9 @@ class HybridRetriever:
         self.embedding_client = EmbeddingClient()
         self.settings = get_settings()
 
-    def retrieve(
-        self,
-        query: str,
-        top_k: int | None = None,
-        filters: dict | None = None,
-        use_hyde: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Recupera chunks combinando búsqueda vectorial y fulltext.
-
-        Args:
-            query: Texto de la consulta.
-            top_k: Número máximo de resultados.
-            filters: Filtros opcionales. Claves soportadas: 'story_title', 'collection'.
-            use_hyde: Si True, aplica HyDE al componente vectorial (el fulltext
-                      siempre usa la query original para preservar keywords exactas).
-
-        Returns:
-            Lista de dicts con keys: text, chunk_id, chunk_index, position,
-            story_title, collection, score.
-        """
+    def retrieve(self, query: str, top_k: int | None = None, filters: dict | None = None,
+                 use_hyde: bool = True) -> list[dict[str, Any]]:
+        """Recupera chunks combinando búsqueda vectorial y fulltext."""
         top_k = top_k or self.settings.top_k_results
         try:
             query_embedding = (
@@ -286,25 +228,9 @@ LIMIT $top_k
             logger.error("Error en búsqueda híbrida: %s", exc)
             return []
 
-    def retrieve_with_context(
-        self,
-        query: str,
-        top_k: int | None = None,
-        filters: dict | None = None,
-        use_hyde: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Recupera chunks con entidades mencionadas usando búsqueda híbrida.
-
-        Args:
-            query: Texto de la consulta.
-            top_k: Número máximo de resultados.
-            filters: Filtros opcionales. Claves soportadas: 'story_title', 'collection'.
-            use_hyde: Si True, aplica HyDE al componente vectorial.
-
-        Returns:
-            Lista de dicts con keys: text, chunk_id, chunk_index, position,
-            story_title, collection, score, characters, locations, objects.
-        """
+    def retrieve_with_context(self, query: str, top_k: int | None = None, filters: dict | None = None,
+                              use_hyde: bool = True) -> list[dict[str, Any]]:
+        """Recupera chunks con entidades mencionadas usando búsqueda híbrida."""
         top_k = top_k or self.settings.top_k_results
         try:
             query_embedding = (

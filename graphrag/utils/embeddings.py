@@ -1,5 +1,3 @@
-"""Utilidades para generación y gestión de embeddings."""
-
 import math
 
 from ..llm.embedding_client import EmbeddingClient
@@ -29,15 +27,11 @@ class EmbeddingGenerator:
         """Genera embeddings para una lista de textos."""
         return self.client.embed(texts)
 
-    def embed_with_prefix(
-        self, text: str, prefix: str = "search_document: "
-    ) -> list[float]:
+    def embed_with_prefix(self, text: str, prefix: str = "search_document: ") -> list[float]:
         """Genera el embedding de un texto con un prefijo de tarea."""
         return self.client.embed_single(prefix + text)
 
-    def embed_chunks(
-        self, chunks: list[dict], text_key: str = "text"
-    ) -> list[dict]:
+    def embed_chunks(self, chunks: list[dict], text_key: str = "text") -> list[dict]:
         """Genera embeddings para una lista de chunks y los añade in-place."""
         texts = [chunk[text_key] for chunk in chunks]
         embeddings = self.client.embed(texts)

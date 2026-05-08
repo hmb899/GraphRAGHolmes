@@ -1,5 +1,3 @@
-"""Cliente de Gemini via Vertex AI para generación de texto."""
-
 import json
 import logging
 import time
@@ -89,24 +87,9 @@ class GeminiClient:
                     raise
         raise last_exc
 
-    def generate(
-        self,
-        prompt: str,
-        model_tier: ModelTier = ModelTier.FLASH,
-        system_instruction: str | None = None,
-        temperature: float = 0.0,
-    ) -> str:
-        """Genera texto libre a partir de un prompt.
-
-        Args:
-            prompt: Texto de entrada para el modelo.
-            model_tier: Nivel de modelo a usar (LITE, FLASH o PRO).
-            system_instruction: Instrucción de sistema opcional.
-            temperature: Temperatura de muestreo (0.0 = determinista).
-
-        Returns:
-            Texto generado por el modelo.
-        """
+    def generate(self, prompt: str, model_tier: ModelTier = ModelTier.FLASH, system_instruction: str | None = None,
+                 temperature: float = 0.0) -> str:
+        """Genera texto libre a partir de un prompt."""
         model = self._resolve_model(model_tier)
         config = types.GenerateContentConfig(
             temperature=temperature,
@@ -122,28 +105,9 @@ class GeminiClient:
         )
         return response.text
 
-    def structured_output(
-        self,
-        prompt: str,
-        schema: Type[T],
-        model_tier: ModelTier = ModelTier.FLASH,
-        system_instruction: str | None = None,
-        temperature: float = 0.0,
-    ) -> T:
-        """Genera una respuesta validada contra un esquema Pydantic.
-
-        Si la respuesta no es JSON puro, aplica extract_json como fallback antes de validar.
-
-        Args:
-            prompt: Texto de entrada para el modelo.
-            schema: Clase Pydantic que define el esquema de salida.
-            model_tier: Nivel de modelo a usar.
-            system_instruction: Instrucción de sistema opcional.
-            temperature: Temperatura de muestreo.
-
-        Returns:
-            Instancia validada del esquema Pydantic.
-        """
+    def structured_output(self, prompt: str, schema: Type[T], model_tier: ModelTier = ModelTier.FLASH,
+                          system_instruction: str | None = None, temperature: float = 0.0) -> T:
+        """Genera una respuesta validada contra un esquema Pydantic; usa extract_json como fallback."""
         model = self._resolve_model(model_tier)
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -151,9 +115,7 @@ class GeminiClient:
             system_instruction=system_instruction,
             temperature=temperature,
         )
-        logger.info(
-            "Structured output con %s → %s", model, schema.__name__
-        )
+        logger.info("Structured output con %s → %s", model, schema.__name__)
 
         response = self._call_with_retry(
             self.client.models.generate_content,
@@ -165,19 +127,13 @@ class GeminiClient:
         try:
             return schema.model_validate_json(response.text)
         except Exception:
-            logger.warning(
-                "model_validate_json falló, aplicando extract_json como fallback."
-            )
+            logger.warning("model_validate_json falló, aplicando extract_json como fallback.")
             data = extract_json(response.text)
             return schema.model_validate(data)
 
-    def generate_with_history(
-        self,
-        messages: list[dict[str, str]],
-        model_tier: ModelTier = ModelTier.FLASH,
-        temperature: float = 0.0,
-    ) -> str:
-        """Genera una respuesta en una conversación multi-turno. """
+    def generate_with_history(self, messages: list[dict[str, str]], model_tier: ModelTier = ModelTier.FLASH,
+                              temperature: float = 0.0) -> str:
+        """Genera una respuesta en una conversación multi-turno."""
         model = self._resolve_model(model_tier)
         contents = [
             types.Content(

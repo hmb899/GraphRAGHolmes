@@ -1,5 +1,3 @@
-"""Descarga y procesamiento de textos de Project Gutenberg."""
-
 import logging
 import os
 import re
@@ -66,10 +64,6 @@ _STORY_COLLECTION_MAP: dict[str, str] = {
 #   1. Numeral romano + ALL CAPS  →  "I. A SCANDAL IN BOHEMIA"  (adventures, return)
 #   2. Numeral romano + Title Case →  "I. Silver Blaze"           (memoirs)
 #   3. ALL CAPS sin numeral        →  "THE ADVENTURE OF THE..."   (return)
-# IMPORTANTE: usar ' ' en vez de '\s' en los character classes para no cruzar
-# líneas en blanco y capturar solo el título de esa línea.
-# Los apóstrofes tipográficos (U+2019) se normalizan a ASCII en
-# clean_gutenberg_text() antes de aplicar este regex.
 _HEADER_RE = re.compile(
     r'\n\n'
     r'('
@@ -83,11 +77,11 @@ _HEADER_RE = re.compile(
     re.MULTILINE,
 )
 
-# Falsos positivos: líneas que coinciden con el patrón pero no son títulos de relato
+# Falsos positivos, líneas que coinciden con el patrón pero no son títulos de relato
 _FALSE_POSITIVES: set[str] = {
     "THE END", "CONTENTS", "PREFACE", "INTRODUCTION", "NOTE", "NOTES",
     "FOREWORD", "APPENDIX", "INDEX", "GLOSSARY", "EDITOR", "DEDICATION",
-    # Títulos de colección (aparecen en ALL CAPS al inicio de cada fichero Gutenberg)
+    # Títulos de colección
     "THE ADVENTURES OF SHERLOCK HOLMES",
     "THE MEMOIRS OF SHERLOCK HOLMES",
     "THE RETURN OF SHERLOCK HOLMES",
@@ -102,17 +96,7 @@ def _normalize(title: str) -> str:
 
 
 def _strip_numeral_prefix(raw: str) -> str:
-    """Elimina prefijos de numeral romano y normaliza a Title Case.
-
-    Gutenberg publica algunos volúmenes con títulos en ALL CAPS y otros en
-    Title Case. Aplicar .title() al final garantiza un formato uniforme
-    independientemente de la colección de origen.
-
-    Ejemplos:
-        'I. A SCANDAL IN BOHEMIA'  -> 'A Scandal In Bohemia'
-        'ADVENTURE II. THE RED-HEADED LEAGUE' -> 'The Red-Headed League'
-        'I. Silver Blaze'          -> 'Silver Blaze'
-    """
+    """Elimina prefijos de numeral romano y normaliza a Title Case."""
     stripped = re.sub(r'^(?:(?:ADVENTURE|STORY)\s+)?[IVXLC]+\.\s+', '', raw.strip()).strip()
     return stripped.title()
 
@@ -125,19 +109,8 @@ class TextProcessor:
         self.settings = settings or get_settings()
         self.embedder = EmbeddingClient()
 
-    # Descarga y limpieza
-
     def download_collection(self, collection_key: str) -> str:
-        """Descarga una colección de Gutenberg y la almacena en disco.
-        Args:
-            collection_key: Clave de la colección.
-
-        Returns:
-            Texto completo de la colección como string.
-
-        Raises:
-            KeyError: Si collection_key no existe en GUTENBERG_COLLECTIONS.
-        """
+        """Descarga una colección de Gutenberg y la almacena en disco."""
         info = GUTENBERG_COLLECTIONS[collection_key]
         os.makedirs(self.settings.data_dir, exist_ok=True)
         path = os.path.join(self.settings.data_dir, f"{collection_key}.txt")
@@ -200,7 +173,6 @@ class TextProcessor:
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
-    # División en relatos
     def split_into_stories(self, text: str, collection_key: str) -> list[dict]:
         """Divide el texto de una colección en relatos individuales."""
         collection_name = GUTENBERG_COLLECTIONS[collection_key]["title"]
@@ -211,7 +183,7 @@ class TextProcessor:
             raw = m.group(1).strip()
             if raw.upper() in _FALSE_POSITIVES:
                 continue
-            # Descarta líneas con más de 10 palabras (párrafos, no títulos)
+            # Descarta líneas con más de 10 palabras
             if len(raw.split()) > 10:
                 continue
             valid_matches.append(m)
@@ -248,25 +220,8 @@ class TextProcessor:
         logger.info("Colección '%s': %d relatos detectados.", collection_key, len(stories))
         return stories
 
-
-    # Procesamiento y carga en Neo4j
-    def process_story(
-        self, story_title: str, story_text: str, collection: str
-    ) -> list[dict]:
-        """Fragmenta un relato, genera embeddings y lo carga en Neo4j.
-
-        Crea un nodo (:Story) si no existe, y un nodo (:Chunk) por cada
-        fragmento con su embedding y metadatos. Los conecta mediante
-        (:Story)-[:HAS_CHUNK]->(:Chunk).
-
-        Args:
-            story_title: Título del relato.
-            story_text: Texto completo del relato.
-            collection: Nombre de la colección.
-
-        Returns:
-            Lista de dicts de chunks enriquecidos (incluyendo embedding e id).
-        """
+    def process_story(self, story_title: str, story_text: str, collection: str) -> list[dict]:
+        """Fragmenta un relato, genera embeddings y lo carga en Neo4j."""
         chunks = chunk_story_with_metadata(
             text=story_text,
             story_title=story_title,
@@ -276,10 +231,7 @@ class TextProcessor:
         )
         logger.info("'%s': %d chunks generados.", story_title, len(chunks))
 
-        # Nodo Story (idempotente)
         self.neo4j.store_story(story_title, collection)
-
-        # Genera todos los embeddings en bloque (muestra progreso por sí mismo)
         embeddings = self.embedder.embed([c["text"] for c in chunks])
 
         for chunk, embedding in tqdm(
@@ -293,20 +245,10 @@ class TextProcessor:
 
         return chunks
 
-
     def _run_pipeline(self, target_titles: set[str] | None = None) -> dict[str, list[dict]]:
-        """Ejecuta el pipeline de descarga y procesamiento.
-
-        Args:
-            target_titles: Conjunto de títulos normalizados a procesar.
-                           None procesa todos los relatos de todas las colecciones.
-
-        Returns:
-            Dict {story_title: [chunks]} para cada relato procesado con éxito.
-        """
+        """Ejecuta el pipeline de descarga y procesamiento."""
         results: dict[str, list[dict]] = {}
 
-        # Determina qué colecciones son necesarias
         if target_titles is not None:
             needed = {
                 col for norm, col in _STORY_COLLECTION_MAP.items()
@@ -335,7 +277,7 @@ class TextProcessor:
                         collection=story["collection"],
                     )
                     results[story["title"]] = chunks
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("Error en '%s': %s. Continuando.", story["title"], exc)
 
         return results
@@ -359,15 +301,7 @@ class TextProcessor:
         return results
 
     def process_stories(self, titles: list[str]) -> dict[str, list[dict]]:
-        """Descarga y procesa una lista arbitraria de relatos por título.
-
-        Args:
-            titles: Lista de títulos en cualquier capitalización
-                    (ej. ["The Adventure of the Speckled Band"]).
-
-        Returns:
-            Dict {story_title: [chunks]} para cada relato procesado.
-        """
+        """Descarga y procesa una lista arbitraria de relatos por título."""
         logger.info("Pipeline personalizado: %d relatos", len(titles))
         targets = {_normalize(t) for t in titles}
         results = self._run_pipeline(target_titles=targets)
@@ -381,11 +315,7 @@ class TextProcessor:
         return results
 
     def process_all(self) -> dict[str, list[dict]]:
-        """Descarga y procesa todos los relatos de todas las colecciones.
-
-        Returns:
-            Dict {story_title: [chunks]} para cada relato procesado.
-        """
+        """Descarga y procesa todos los relatos de todas las colecciones."""
         logger.info("Pipeline completo: todas las colecciones")
         results = self._run_pipeline(target_titles=None)
         logger.info("Pipeline completado: %d relatos procesados.", len(results))

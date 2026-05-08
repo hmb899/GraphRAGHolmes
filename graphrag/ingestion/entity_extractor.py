@@ -1,6 +1,5 @@
-"""Extracción multipaso de entidades y relaciones con sliding context."""
-
 import logging
+import re
 
 from pydantic import BaseModel, Field
 from tqdm import tqdm
@@ -13,13 +12,11 @@ from ..utils.embeddings import cosine_similarity
 logger = logging.getLogger(__name__)
 
 
-# Modelos de entidades (coinciden con los nodos)
-
 class CharacterEntity(BaseModel):
     """Un personaje mencionado en el fragmento."""
 
     name: str = Field(..., description="Nombre del personaje exactamente como aparece en el texto")
-    # No rellenar — se reconstruye automáticamente en entity resolution.
+    # No rellenar, se reconstruye automáticamente en entity resolution.
     aliases: list[str] = Field(
         default_factory=list,
         description="Leave empty. Do not populate. Auto-generated during entity resolution.",
@@ -96,9 +93,6 @@ class EventEntity(BaseModel):
     description: str = Field(default="", description="Descripción del evento")
 
 
-
-# Modelos de relaciones
-
 class ExtractedRelationship(BaseModel):
     """Una relación extraída entre dos entidades del grafo."""
 
@@ -118,9 +112,6 @@ class ExtractedRelationship(BaseModel):
     )
 
 
-
-# Contenedores para structured output
-
 class EntityExtractionResult(BaseModel):
     """Resultado completo de la extracción de entidades de un chunk."""
 
@@ -139,8 +130,6 @@ class RelationshipExtractionResult(BaseModel):
     relationships: list[ExtractedRelationship] = Field(default_factory=list)
 
 
-
-# Contexto narrativo acumulativo (sliding context)
 
 class NarrativeContext(BaseModel):
     """Estado narrativo acumulado del relato a lo largo del sliding context."""
@@ -173,10 +162,6 @@ class NarrativeContext(BaseModel):
     )
 
 
-
-# Funciones auxiliares a nivel de módulo
-
-
 def _normalize_name(name: str) -> str:
     """Normaliza un nombre para comparación: lowercase y espacios simples."""
     return " ".join(name.lower().strip().split())
@@ -193,16 +178,7 @@ _TITLE_PREFIXES: frozenset[str] = frozenset({
 
 
 def _strip_titles(name: str) -> str:
-    """Elimina títulos y honoríficos de un nombre para comparación.
-
-    Ejemplos:
-        'Mr. Sherlock Holmes'  → 'sherlock holmes'
-        'Colonel James Moriarty' → 'james moriarty'
-        'Dr. Watson'           → 'watson'
-
-    Si tras el strip no queda nada (p. ej. 'the colonel'), devuelve
-    el nombre normalizado original para no perder la referencia.
-    """
+    """Elimina títulos y honoríficos de un nombre para comparación."""
     tokens = _normalize_name(name).replace(",", "").replace(".", "").split()
     core = [t for t in tokens if t not in _TITLE_PREFIXES]
     return " ".join(core) if core else _normalize_name(name)
@@ -225,9 +201,9 @@ def _is_word_suffix(short: str, long: str) -> bool:
     """True si 'short' coincide exactamente con los últimos tokens de 'long'
     y la diferencia de longitud no supera _MAX_EXTRA_TOKENS.
 
-    Ejemplo: 'holmes' es suffix de 'sherlock holmes' (diff=1) ✓
-             'norton' NO es suffix de 'irene norton adler' (último token='adler') ✗
-             'holmes' NO es suffix de 'sherlock holmes detective for the king' (diff=5) ✗
+    Ejemplo: 'holmes' es suffix de 'sherlock holmes' (diff=1)
+             'norton' NO es suffix de 'irene norton adler' (último token='adler')
+             'holmes' NO es suffix de 'sherlock holmes detective for the king' (diff=5)
     """
     s = short.split()
     l = long.split()
@@ -242,8 +218,8 @@ def _is_word_prefix(short: str, long: str) -> bool:
     """True si 'short' coincide exactamente con los primeros tokens de 'long'
     y la diferencia de longitud no supera _MAX_EXTRA_TOKENS.
 
-    Ejemplo: 'king' es prefix de 'king of bohemia' (diff=2) ✓
-             'sherlock holmes' NO es prefix de 'sherlock holmes detective for...' (diff>2) ✗
+    Ejemplo: 'king' es prefix de 'king of bohemia' (diff=2)
+             'sherlock holmes' NO es prefix de 'sherlock holmes detective for...' (diff>2)
     """
     s = short.split()
     l = long.split()
@@ -254,38 +230,18 @@ def _is_word_prefix(short: str, long: str) -> bool:
     )
 
 
+_MILITARY_RANKS: frozenset[str] = frozenset({"major-general", "general", "colonel", "admiral", "lieutenant"})
+_FEMALE_PERSONAL: frozenset[str] = frozenset({"miss", "ms"})
+_MALE_OR_PROFESSIONAL: frozenset[str] = frozenset({"dr", "mr", "mister", "sir", "lord", "professor", "prof",})
+
+
 def _rule_based_same_character(name_a: str, name_b: str) -> bool:
-    """Devuelve True si dos cadenas de nombre probablemente refieren al mismo personaje.
-
-    Aplica dos heurísticas en orden:
-    1. Igualdad exacta tras eliminar títulos.
-       Excepción: si el resultado es un único token y AMBOS originales son
-       solo título+apellido (sin nombre de pila), no se fusionan —
-       p. ej. "Miss Stoner" ≠ "Mrs. Stoner" (personajes distintos de la misma familia).
-    2. Uno de los nombres (sin títulos) es SUFFIX o PREFIX por tokens del otro.
-       Usa word-boundary, NO substring arbitrario — esto evita que 'norton' en
-       'irene norton adler' cause una fusión incorrecta con 'Godfrey Norton'.
-
-    No usa embeddings semánticos: los embeddings de texto corto confunden
-    nombres de personajes distintos del mismo dominio (todos se agrupan).
-
-    Args:
-        name_a: Primer nombre candidato.
-        name_b: Segundo nombre candidato.
-
-    Returns:
-        True si las heurísticas indican que son el mismo personaje.
-    """
+    """Devuelve True si dos cadenas de nombre probablemente refieren al mismo personaje."""
     a = _strip_titles(name_a)
     b = _strip_titles(name_b)
     if not a or not b:
         return False
 
-    # Pre-check: "mrs" como título señala a una mujer casada que es una
-    # persona DISTINTA del personaje con el mismo apellido sin ese título.
-    # Si uno de los dos nombres empieza por "mrs" y el otro no, nunca son
-    # el mismo personaje — esto bloquea tanto la comparación por igualdad
-    # como la de suffix/prefix más abajo.
     # Ej: "Mrs. Watson" ≠ "Watson", "Mrs. Straker" ≠ "John Straker",
     #     "Mrs. Henry Baker" ≠ "Mr. Henry Baker"
     tokens_a = _normalize_name(name_a).replace(",", "").replace(".", "").split()
@@ -299,25 +255,17 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
         return False
 
     # Título femenino personal (Miss/Ms) no puede coincidir con un nombre que
-    # tenga título profesional/masculino (Dr/Mr/Sir...) Y además nombre de pila.
+    # tenga título profesional/masculino (Dr./Mr./Sir...) Y además nombre de pila.
     # Evita que "Miss Roylott" (alias de Helen Stoner) se fusione con
     # "Dr. Grimesby Roylott" por compartir el apellido.
-    _FEMALE_PERSONAL = {"miss", "ms"}
-    _MALE_OR_PROFESSIONAL = {"dr", "mr", "mister", "sir", "lord", "professor", "prof"}
     if title_a in _FEMALE_PERSONAL and title_b in _MALE_OR_PROFESSIONAL:
-        if len(b.split()) >= 2:  # b tiene nombre de pila → persona distinta
+        if len(b.split()) >= 2:  # b tiene nombre de pila, persona distinta
             return False
     if title_b in _FEMALE_PERSONAL and title_a in _MALE_OR_PROFESSIONAL:
         if len(a.split()) >= 2:
             return False
 
-    # 1. Igualdad exacta tras strip de títulos
     if a == b:
-        # Caso A: token único, ambos con título distinto y sin nombre de pila
-        # → probablemente personas distintas de la misma familia.
-        # Ej: "Miss Stoner" ≠ "Mrs. Stoner"
-        # La guarda `_normalize_name(name_a) != _normalize_name(name_b)` evita
-        # que "Mrs. Hudson" == "Mrs. Hudson" (mismo nombre) dispare este caso.
         if (
             len(a.split()) == 1
             and not _is_bare_name(name_a, a)
@@ -327,18 +275,6 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
             return False
         return True
 
-    # 2. Word-boundary suffix o prefix: 'holmes' suffix de 'sherlock holmes',
-    #    'king' prefix de 'king of bohemia'.
-    #    Se excluye el substring arbitrario para evitar falsos positivos como
-    #    'norton' (substring de 'irene norton adler' pero NO suffix).
-    #
-    # Guard: rangos militares stripped a un único token (apellido) no deben
-    # fusionarse por suffix con nombres que tienen nombre de pila, porque
-    # podrían ser parientes distintos (ej. "Major-General Stoner" ≠ "Helen Stoner").
-    # Los apellidos desnudos (sin rango, ej. "Holmes") sí pueden hacer suffix.
-    _MILITARY_RANKS: frozenset[str] = frozenset({
-        "major-general", "general", "colonel", "admiral", "lieutenant",
-    })
     a_mil_single = len(a.split()) == 1 and title_a in _MILITARY_RANKS
     b_mil_single = len(b.split()) == 1 and title_b in _MILITARY_RANKS
 
@@ -355,21 +291,7 @@ def _rule_based_same_character(name_a: str, name_b: str) -> bool:
 
 
 def _merge_entity_group(group: list, name_attr: str = "name", prefer_proper_name: bool = False) -> object:
-    """Fusiona un grupo de entidades en una sola instancia.
-
-    Elige el nombre canónico más completo, combina
-    aliases y concatena descripciones únicas.
-
-    Args:
-        group: Lista de instancias de entidad del mismo tipo.
-        name_attr: Nombre del atributo que actúa como identificador principal.
-        prefer_proper_name: Si True (Characters), elige el canónico con más
-            tokens de nombre real tras quitar títulos. Evita que rangos
-            militares como "Major-General Stoner" ganen a "Helen Stoner".
-
-    Returns:
-        Una única instancia de entidad fusionada.
-    """
+    """Fusiona un grupo de entidades en una sola instancia."""
     if len(group) == 1:
         return group[0]
 
@@ -382,7 +304,6 @@ def _merge_entity_group(group: list, name_attr: str = "name", prefer_proper_name
             return (n_tokens, len(stripped), -len(name))
         canonical = max(group, key=lambda e: _proper_name_score(getattr(e, name_attr, "")))
     else:
-        # Nombre canónico = la variante más larga
         canonical = max(group, key=lambda e: len(getattr(e, name_attr, "")))
 
     updates: dict = {}
@@ -396,7 +317,6 @@ def _merge_entity_group(group: list, name_attr: str = "name", prefer_proper_name
         all_aliases.discard(getattr(canonical, name_attr))
         updates["aliases"] = sorted(all_aliases)
 
-    # Combina descriptions si existen
     if hasattr(canonical, "description"):
         descs = {
             getattr(e, "description", "")
@@ -410,14 +330,7 @@ def _merge_entity_group(group: list, name_attr: str = "name", prefer_proper_name
 
 
 def _build_canonical_map(resolved: EntityExtractionResult) -> dict[str, str]:
-    """Construye un mapa alias_normalizado, nombre_canónico a partir de personajes resueltos.
-
-    Args:
-        resolved: Resultado de entity resolution con nombres canónicos y aliases.
-
-    Returns:
-        Dict que mapea cada alias normalizado al nombre canónico del personaje.
-    """
+    """Construye un mapa alias_normalizado, nombre_canónico a partir de personajes resueltos."""
     mapping: dict[str, str] = {}
     for char in resolved.characters:
         for alias in char.aliases:
@@ -445,7 +358,6 @@ def _rule_based_same_location(name_a: str, name_b: str) -> bool:
 
     def _tokens(s: str) -> set[str]:
         """Tokeniza eliminando puntuación para que 'street,' == 'street'."""
-        import re
         return {t for t in re.sub(r"[^a-z0-9\s]", "", s).split() if t}
 
     tokens_a = _tokens(a)
@@ -455,19 +367,9 @@ def _rule_based_same_location(name_a: str, name_b: str) -> bool:
     return len(shorter) >= 2 and shorter.issubset(longer)
 
 
-def _remap_relationships(
-    relationships: list[ExtractedRelationship],
-    canonical_map: dict[str, str],
-) -> list[ExtractedRelationship]:
-    """Actualiza source_name y target_name de las relaciones con nombres canónicos.
-
-    Args:
-        relationships: Lista de relaciones extraídas.
-        canonical_map: Mapa alias, nombre canónico (de _build_canonical_map).
-
-    Returns:
-        Lista de relaciones con nombres normalizados.
-    """
+def _remap_relationships(relationships: list[ExtractedRelationship], canonical_map: dict[str, str])\
+        -> list[ExtractedRelationship]:
+    """Actualiza source_name y target_name de las relaciones con nombres canónicos."""
     remapped = []
     for rel in relationships:
         source = canonical_map.get(_normalize_name(rel.source_name), rel.source_name)
@@ -478,8 +380,41 @@ def _remap_relationships(
     return remapped
 
 
+_GENERIC_PREFIXES: tuple[str, ...] = (
+  "the ", "a ", "an ",
+  "my ", "your ", "his ", "her ",
+  "our ", "this ", "that ",
+  "young ", "old ", "elderly ", "huge ", "large ", "little ",
+  "local ", "native ", "poor ", "wandering ", "half-pay ",
+)
+_GENERIC_EXACT: frozenset[str] = frozenset({
+  "i", "we", "he", "she", "they", "you", "it",
+  "him", "her", "them", "us", "me", "myself",
+  "doctor", "inspector", "narrator", "gentleman",
+  "companion", "stranger", "visitor", "assistant",
+  "husband", "wife", "maid", "porter", "lad",
+  "coachman", "landlord", "landlady",
+  "sister", "brother", "aunt", "uncle", "cousin",
+  "mother", "father", "daughter", "son", "widow",
+  "housekeeper", "butler", "footman", "driver", "guard",
+  "blacksmith", "carpenter", "gardener", "gamekeeper",
+  "groom", "cook", "nurse", "clerk", "constable",
+  "madam", "madame",
+  "band", "crowd", "gang", "mob",
+})
+_GENERIC_LOC_WORDS: frozenset[str] = frozenset({
+  "room", "rooms", "corridor", "chamber", "chambers", "bedroom",
+  "hall", "hallway", "passage", "passageway", "landing", "staircase",
+  "stairs", "stair", "floor", "wing", "block", "building", "buildings",
+  "door", "window", "wall", "ceiling", "roof", "garden", "lawn",
+  "courtyard", "yard", "grounds", "area", "space", "place", "spot",
+  "interior", "exterior", "outside", "inside",
+})
+_LOC_PREFIXES_GENERIC: tuple[str, ...] = (
+  "the ", "a ", "an ", "your ", "my ", "his ", "her ", "our ",
+  "this ", "that ", "some ", "another ", "next ", "other ",
+)
 
-# Extractor principal
 
 class EntityExtractor:
     """Extrae entidades y relaciones de los relatos de Sherlock Holmes.
@@ -496,41 +431,30 @@ class EntityExtractor:
     # indistinguibles entre sí y provocan fusiones erróneas.
     _MERGE_THRESHOLD = 0.92
     _AMBIGUOUS_THRESHOLD = 0.80
+    _BOTH_MUST_EXIST: frozenset = frozenset({"KNOWS", "INVESTIGATES", "PRESENT_IN", "PARTICIPATES_IN", "FOLLOWS"})
+    _INVESTIGATES_PRIORITY: dict = {
+        "perpetrator": 0, "victim": 1, "suspect": 2,"witness": 3,
+        "client": 4, "investigator": 5
+    }
+    _KNOWS_PRIORITY: dict = {
+        "enemy": 0, "family": 1, "friend": 2, "colleague": 3,
+        "client": 4, "acquaintance": 5,
+    }
 
     def __init__(self) -> None:
         self.gemini = GeminiClient()
         self.embeddings = EmbeddingClient()
         self.settings = get_settings()
 
+    def _update_sliding_context(self, current_context: NarrativeContext, chunk_text: str,
+                                extracted_entities: EntityExtractionResult) -> NarrativeContext:
+        """Actualiza el contexto narrativo acumulativo tras procesar un chunk sin llamar al LLM."""
 
-    # Sliding context
-
-    def _update_sliding_context(
-        self,
-        current_context: NarrativeContext,
-        chunk_text: str,
-        extracted_entities: EntityExtractionResult,
-    ) -> NarrativeContext:
-        """Actualiza el contexto narrativo acumulativo tras procesar un chunk.
-
-        Construye el contexto directamente desde las entidades extraídas,
-        sin llamar al LLM. Esto evita consumir cuota de Flash-Lite y elimina
-        los timeouts que ralentizaban el pipeline cuando se agotaba la cuota.
-
-        Args:
-            current_context: Estado narrativo hasta el chunk anterior.
-            chunk_text: Texto del chunk recién procesado (no usado, mantenido por firma).
-            extracted_entities: Entidades extraídas del chunk actual.
-
-        Returns:
-            NarrativeContext actualizado.
-        """
         chars = [c.name for c in extracted_entities.characters]
         locs  = [l.name for l in extracted_entities.locations]
         events = [e.name for e in extracted_entities.events]
         crimes = [c.name for c in extracted_entities.crimes]
 
-        # Mantener los 3 eventos más recientes del contexto anterior + los nuevos
         recent = (current_context.recent_events + events)[-5:]
 
         # Acumular nombres de crímenes ya asignados (evita que cada chunk invente uno nuevo).
@@ -550,29 +474,10 @@ class EntityExtractor:
             known_crime_names=known_crimes,
         )
 
+    def extract_entities(self, chunk_text: str, context: NarrativeContext | None = None,
+                         story_title: str = "") -> EntityExtractionResult:
+        """Extrae entidades tipadas de un fragmento de texto."""
 
-    # Extracción multipaso
-
-    def extract_entities(
-        self,
-        chunk_text: str,
-        context: NarrativeContext | None = None,
-        story_title: str = "",
-    ) -> EntityExtractionResult:
-        """Extrae entidades tipadas de un fragmento de texto.
-
-        Incluye el contexto narrativo acumulado en el prompt cuando está
-        disponible, para mejorar la resolución de referencias ambiguas.
-
-        Args:
-            chunk_text: Texto del chunk a analizar.
-            context: Contexto narrativo acumulado hasta este punto.
-            story_title: Título del relato, para anclar el contexto al LLM.
-
-        Returns:
-            EntityExtractionResult con todas las entidades detectadas.
-            Devuelve un resultado vacío si el LLM falla.
-        """
         context_section = ""
         if context:
             present = (
@@ -629,26 +534,10 @@ Be thorough with named entities. For characters, list ALL proper name variants u
             logger.warning("Error extrayendo entidades: %s. Devolviendo resultado vacío.", exc)
             return EntityExtractionResult()
 
-    def extract_relationships(
-        self,
-        chunk_text: str,
-        entities: EntityExtractionResult,
-        context: NarrativeContext | None = None,
-    ) -> RelationshipExtractionResult:
-        """Extrae relaciones entre las entidades ya identificadas.
+    def extract_relationships(self, chunk_text: str, entities: EntityExtractionResult,
+                              context: NarrativeContext | None = None) -> RelationshipExtractionResult:
+        """Extrae relaciones entre las entidades ya identificadas."""
 
-        Recibe las entidades del Paso 1 para proporcionar al LLM la lista
-        exacta de nodos entre los que buscar conexiones.
-
-        Args:
-            chunk_text: Texto original del chunk.
-            entities: Entidades extraídas en el Paso 1.
-            context: Contexto narrativo acumulado (opcional).
-
-        Returns:
-            RelationshipExtractionResult con las relaciones detectadas.
-            Devuelve un resultado vacío si el LLM falla.
-        """
         character_names = [c.name for c in entities.characters]
         location_names = [loc.name for loc in entities.locations]
         crime_names = [c.name for c in entities.crimes]
@@ -725,21 +614,8 @@ Only extract relationships that are explicitly supported by the text. Include th
             return RelationshipExtractionResult()
 
 
-    # Entity resolution
-
-    def _llm_confirm_same_entity(
-        self, name_a: str, name_b: str, entity_type: str
-    ) -> bool:
-        """Pregunta al LLM si dos nombres corresponden a la misma entidad.
-
-        Args:
-            name_a: Primer nombre candidato.
-            name_b: Segundo nombre candidato.
-            entity_type: Tipo de entidad (Character, Location, etc.).
-
-        Returns:
-            True si el LLM confirma que son la misma entidad.
-        """
+    def _llm_confirm_same_entity(self, name_a: str, name_b: str, entity_type: str) -> bool:
+        """Pregunta al LLM si dos nombres corresponden a la misma entidad."""
         class _SameEntityResponse(BaseModel):
             same: bool
             canonical_name: str = ""
@@ -762,26 +638,11 @@ Only extract relationships that are explicitly supported by the text. Include th
             )
             return False
 
-    def _resolve_typed_entities(
-        self,
-        entities: list,
-        entity_type: str,
-        name_attr: str = "name",
-    ) -> list:
-        """Resuelve duplicados en una lista de entidades del mismo tipo.
-
-        Args:
-            entities: Lista de instancias de entidad.
-            entity_type: Nombre del tipo (para el prompt LLM).
-            name_attr: Atributo que actúa como nombre primario de la entidad.
-
-        Returns:
-            Lista de entidades deduplicadas y fusionadas.
-        """
+    def _resolve_typed_entities(self, entities: list, entity_type: str, name_attr: str = "name") -> list:
+        """Resuelve duplicados en una lista de entidades del mismo tipo."""
         if not entities:
             return []
 
-        #agrupación por nombre normalizado
         groups: dict[str, list] = {}
         for entity in entities:
             key = _normalize_name(getattr(entity, name_attr, ""))
@@ -809,10 +670,6 @@ Only extract relationships that are explicitly supported by the text. Include th
                     if _rule_based_same_character(name_a, name_b):
                         to_merge.append((i, j))
         else:
-            # Para Location, Object, Event, Scene: embeddings con umbral alto.
-
-            # Pre-paso solo para Location: regla de contenimiento de tokens.
-            # Captura "Baker Street" ↔ "Baker Street lodgings" sin necesitar embeddings.
             already_merged: set[tuple[int, int]] = set()
             if entity_type == "Location":
                 for i in range(len(merged)):
@@ -854,7 +711,6 @@ Only extract relationships that are explicitly supported by the text. Include th
                     elif sim > ambiguous_threshold:
                         llm_candidates.append((i, j))
 
-            # LLM para zona gris (solo entidades no-personaje)
             for i, j in llm_candidates:
                 name_a = getattr(merged[i], name_attr)
                 name_b = getattr(merged[j], name_attr)
@@ -864,7 +720,6 @@ Only extract relationships that are explicitly supported by the text. Include th
         if not to_merge:
             return merged
 
-        # Union-Find para agrupar componentes conectadas
         parent = list(range(len(merged)))
 
         def _find(x: int) -> int:
@@ -895,7 +750,7 @@ Only extract relationships that are explicitly supported by the text. Include th
                     fn_j = _first_names_in_group(rj)
                     combined = fn_i | fn_j
                     if len(combined) >= 2:
-                        continue  # conflicto de nombre de pila → no fusionar
+                        continue  # conflicto de nombre de pila, no fusionar
                 parent[rj] = ri
 
         root_to_group: dict[int, list] = {}
@@ -904,18 +759,9 @@ Only extract relationships that are explicitly supported by the text. Include th
 
         return [_merge_entity_group(g, name_attr, prefer_proper_name=is_character) for g in root_to_group.values()]
 
-    def resolve_entities(
-        self,
-        all_entities: list[EntityExtractionResult],
-    ) -> EntityExtractionResult:
-        """Consolida y deduplicada entidades acumuladas de todos los chunks.
+    def resolve_entities(self, all_entities: list[EntityExtractionResult]) -> EntityExtractionResult:
+        """Consolida y deduplicada entidades acumuladas de todos los chunks."""
 
-        Args:
-            all_entities: Lista de EntityExtractionResult, uno por chunk.
-
-        Returns:
-            EntityExtractionResult consolidado con entidades deduplicadas.
-        """
         # Descartar aliases que haya generado el LLM — se reconstruyen desde
         # los nombres reales de cada chunk en _merge_entity_group.
         characters = [
@@ -929,40 +775,6 @@ Only extract relationships that are explicitly supported by the text. Include th
         scenes = [e for r in all_entities for e in r.scenes]
         events = [e for r in all_entities for e in r.events]
 
-        # Filtrar referencias genéricas que el LLM extrae como personajes.
-        # Usa matching por prefijo para cubrir "the X", "a X", "my X", etc.
-        # independientemente de qué sea X, más exact-match para pronombres y
-        # roles sueltos sin artículo.
-        _GENERIC_PREFIXES: tuple[str, ...] = (
-            "the ", "a ", "an ",              # artículos: "the lad", "a rough"
-            "my ", "your ", "his ", "her ",   # posesivos: "my uncle Elias", "her lawyer"
-            "our ", "this ", "that ",         # otros determinantes
-            # Adjetivos descriptivos sin nombre propio a continuación
-            "young ", "old ", "elderly ", "huge ", "large ", "little ",
-            "local ", "native ", "poor ", "wandering ", "half-pay ",
-        )
-        _GENERIC_EXACT: frozenset[str] = frozenset({
-            # Pronombres
-            "i", "we", "he", "she", "they", "you", "it",
-            "him", "her", "them", "us", "me", "myself",
-            # Roles sueltos sin artículo ni nombre propio
-            "doctor", "inspector", "narrator", "gentleman",
-            "companion", "stranger", "visitor", "assistant",
-            "husband", "wife", "maid", "porter", "lad",
-            "coachman", "landlord", "landlady",
-            # Parentesco
-            "sister", "brother", "aunt", "uncle", "cousin",
-            "mother", "father", "daughter", "son", "widow",
-            # Oficios / roles sin nombre
-            "housekeeper", "butler", "footman", "driver", "guard",
-            "blacksmith", "carpenter", "gardener", "gamekeeper",
-            "groom", "cook", "nurse", "clerk", "constable",
-            # Formas de tratamiento genéricas
-            "madam", "madame",
-            # Colectivos
-            "band", "crowd", "gang", "mob",
-        })
-
         def _is_generic(name: str) -> bool:
             n = _normalize_name(name)
             return any(n.startswith(p) for p in _GENERIC_PREFIXES) or n in _GENERIC_EXACT
@@ -973,30 +785,11 @@ Only extract relationships that are explicitly supported by the text. Include th
             and len(_normalize_name(c.name)) > 1
         ]
 
-        # Filtrar locaciones puramente posicionales/genéricas sin nombre propio.
-        # Ejemplos a descartar: "the room", "corridor", "second chamber", "your room".
-        # Ejemplos a conservar: "Stoke Moran Manor House", "Dr. Roylott's chamber".
-        _GENERIC_LOC_WORDS: frozenset[str] = frozenset({
-            "room", "rooms", "corridor", "chamber", "chambers", "bedroom",
-            "hall", "hallway", "passage", "passageway", "landing", "staircase",
-            "stairs", "stair", "floor", "wing", "block", "building", "buildings",
-            "door", "window", "wall", "ceiling", "roof", "garden", "lawn",
-            "courtyard", "yard", "grounds", "area", "space", "place", "spot",
-            "interior", "exterior", "outside", "inside",
-        })
-        _LOC_PREFIXES_GENERIC: tuple[str, ...] = (
-            "the ", "a ", "an ", "your ", "my ", "his ", "her ", "our ",
-            "this ", "that ", "some ", "another ", "next ", "other ",
-        )
-
         def _is_generic_location(name: str) -> bool:
-            import re
             n = _normalize_name(name)
-            # Quitar prefijos genéricos
             for p in _LOC_PREFIXES_GENERIC:
                 if n.startswith(p):
                     n = n[len(p):]
-            # Si tras quitar prefijos el nombre es solo palabras genéricas → descartar
             tokens = re.sub(r"[^a-z0-9\s]", "", n).split()
             return bool(tokens) and all(t in _GENERIC_LOC_WORDS for t in tokens)
 
@@ -1017,25 +810,9 @@ Only extract relationships that are explicitly supported by the text. Include th
             events=self._resolve_typed_entities(events, "Event"),
         )
 
-    # Pipeline completo de un relato
 
-
-    def process_story_chunks(
-        self,
-        chunks: list[dict],
-        story_title: str,
-    ) -> dict:
-        """Orquesta la extracción completa de un relato chunk a chunk.
-
-        Args:
-            chunks: Lista de dicts de chunks (salida de chunk_story_with_metadata).
-            story_title: Título del relato.
-
-        Returns:
-            Dict con claves: story_title, entities (EntityExtractionResult
-            consolidado), relationships (list[ExtractedRelationship]) y
-            chunks_processed (int).
-        """
+    def process_story_chunks(self, chunks: list[dict], story_title: str) -> dict:
+        """Orquesta la extracción completa de un relato chunk a chunk."""
         context = NarrativeContext()
         all_entity_results: list[EntityExtractionResult] = []
         all_relationships: list[ExtractedRelationship] = []
@@ -1048,10 +825,8 @@ Only extract relationships that are explicitly supported by the text. Include th
             chunk_text = chunk["text"]
             logger.info("Procesando chunk %d/%d de '%s'", i + 1, total, story_title)
 
-            # entidades
             entities = self.extract_entities(chunk_text, context, story_title)
 
-            # Detectar chunks vacíos (posibles fallos de API silenciosos)
             if not any([
                 entities.characters, entities.locations, entities.crimes,
                 entities.objects, entities.deductions, entities.scenes, entities.events,
@@ -1075,11 +850,9 @@ Only extract relationships that are explicitly supported by the text. Include th
                 "entity_names": names,
             })
 
-            # relaciones
             relationships = self.extract_relationships(chunk_text, entities, context)
             all_relationships.extend(relationships.relationships)
 
-            # Actualiza contexto para el siguiente chunk
             try:
                 context = self._update_sliding_context(context, chunk_text, entities)
             except Exception as exc:
@@ -1087,7 +860,6 @@ Only extract relationships that are explicitly supported by the text. Include th
                     "Error actualizando contexto en chunk %d/%d: %s", i + 1, total, exc
                 )
 
-        # Validación post-extracción: advertir si demasiados chunks fallaron
         if failed_chunks > 0:
             ratio = failed_chunks / total
             msg = (
@@ -1099,11 +871,10 @@ Only extract relationships that are explicitly supported by the text. Include th
             else:
                 logger.warning(msg)
 
-        # Entity resolution
         logger.info("Iniciando entity resolution para '%s' (%d chunks)...", story_title, total)
         consolidated = self.resolve_entities(all_entity_results)
 
-        # Normaliza referencias en las relaciones con los nombres canónicos
+
         canonical_map = _build_canonical_map(consolidated)
         resolved_relationships = _remap_relationships(all_relationships, canonical_map)
 
@@ -1119,9 +890,7 @@ Only extract relationships that are explicitly supported by the text. Include th
             | {e["name"] for e in consolidated.model_dump().get("events", [])}
             | {d["observation"] for d in consolidated.model_dump().get("deductions", [])}
         )
-        # Tipos de relación donde AMBOS extremos deben ser entidades conocidas
-        _BOTH_MUST_EXIST = {"KNOWS", "INVESTIGATES", "PRESENT_IN", "PARTICIPATES_IN",
-                            "FOLLOWS"}
+
         # LEADS_TO y BASED_ON usan textos largos de observación como claves.
         # El LLM los parafrasea ligeramente, así que se usa matching por prefijo
         # (primeros 40 chars) en vez de igualdad exacta.
@@ -1138,7 +907,7 @@ Only extract relationships that are explicitly supported by the text. Include th
             r for r in resolved_relationships
             if r.source_name in known_names
             and (
-                r.relationship_type not in _BOTH_MUST_EXIST
+                r.relationship_type not in self._BOTH_MUST_EXIST
                 or r.target_name in known_names
             )
             and (
@@ -1150,42 +919,25 @@ Only extract relationships that are explicitly supported by the text. Include th
         if dropped:
             logger.info("Filtradas %d relaciones huerfanas (source o target no canónico).", dropped)
 
-        # Deduplicar relaciones: por cada tripleta (source, type, target) se queda
-        # una sola instancia. Cuando hay varias, se fusionan las properties eligiendo
-        # el valor más específico (para INVESTIGATES: perpetrator > victim > suspect >
-        # witness > investigator; para KNOWS: el relationship_type más frecuente).
-        _INVESTIGATES_PRIORITY = {
-            "perpetrator": 0, "victim": 1, "suspect": 2,
-            "witness": 3, "client": 4, "investigator": 5,
-        }
-
         seen: dict[tuple, ExtractedRelationship] = {}
         for rel in resolved_relationships:
             key = (rel.source_name, rel.relationship_type, rel.target_name)
             if key not in seen:
                 seen[key] = rel
             else:
-                # Fusionar properties: para INVESTIGATES elegir role más específico
                 existing = seen[key]
                 if rel.relationship_type == "INVESTIGATES":
                     cur_role = existing.properties.get("role", "investigator")
                     new_role = rel.properties.get("role", "investigator")
-                    if (_INVESTIGATES_PRIORITY.get(new_role, 99)
-                            < _INVESTIGATES_PRIORITY.get(cur_role, 99)):
+                    if (self._INVESTIGATES_PRIORITY.get(new_role, 99)
+                            < self._INVESTIGATES_PRIORITY.get(cur_role, 99)):
                         seen[key] = rel
 
-        # KNOWS adicional: deduplicar por par no ordenado {A, B}, conservando
-        # solo una dirección con el relationship_type más específico.
-        # Esto evita tener Holmes→Watson[friend] + Watson→Holmes[friend].
-        _KNOWS_PRIORITY = {
-            "enemy": 0, "family": 1, "friend": 2, "colleague": 3,
-            "client": 4, "acquaintance": 5,
-        }
         knows_best: dict[frozenset, ExtractedRelationship] = {}
         non_knows: list[ExtractedRelationship] = []
         for rel in seen.values():
             if rel.source_name == rel.target_name:
-                continue  # self-loop
+                continue
             if rel.relationship_type != "KNOWS":
                 non_knows.append(rel)
             else:
@@ -1196,7 +948,7 @@ Only extract relationships that are explicitly supported by the text. Include th
                     existing = knows_best[pair]
                     cur_t = existing.properties.get("relationship_type", "acquaintance")
                     new_t = rel.properties.get("relationship_type", "acquaintance")
-                    if _KNOWS_PRIORITY.get(new_t, 99) < _KNOWS_PRIORITY.get(cur_t, 99):
+                    if self._KNOWS_PRIORITY.get(new_t, 99) < self._KNOWS_PRIORITY.get(cur_t, 99):
                         knows_best[pair] = rel
 
         before_dedup = len(resolved_relationships)
@@ -1230,31 +982,9 @@ Only extract relationships that are explicitly supported by the text. Include th
             "chunk_entities": chunk_entities,
         }
 
-    # Cross-story normalization
+    def normalize_cross_story_entities(self, all_results: dict[str, dict]) -> dict[str, dict]:
+        """Unifica nombres canónicos de Characters entre todos los relatos."""
 
-    def normalize_cross_story_entities(
-        self, all_results: dict[str, dict]
-    ) -> dict[str, dict]:
-        """Unifica nombres canónicos de Characters entre todos los relatos.
-
-        La entity resolution por relato puede elegir variantes distintas como
-        nombre canónico para el mismo personaje (p. ej. 'Mr. Sherlock Holmes'
-        en un relato, 'Sherlock Holmes' en otro). Al hacer MERGE en Neo4j,
-        esto produce nodos duplicados.
-
-        Este método recorre todos los resultados, agrupa variantes equivalentes
-        mediante _rule_based_same_character y elige un único canónico global
-        (preferencia: nombre sin títulos honoríficos, luego el más largo).
-        Actualiza nombres en entidades y relaciones de todos los relatos.
-
-        Args:
-            all_results: Dict {story_title: result_dict} devuelto por
-                         process_story_chunks para cada relato.
-
-        Returns:
-            Nuevo dict con los mismos relatos pero nombres canónicos unificados.
-        """
-        # 1. Recoger todos los nombres canónicos de Character
         all_names = sorted({
             char["name"]
             for result in all_results.values()
@@ -1263,7 +993,6 @@ Only extract relationships that are explicitly supported by the text. Include th
         if not all_names:
             return all_results
 
-        # 2. Union-Find entre variantes equivalentes cross-story
         parent = list(range(len(all_names)))
 
         def _find(x: int) -> int:
@@ -1279,18 +1008,10 @@ Only extract relationships that are explicitly supported by the text. Include th
                     if ri != rj:
                         parent[rj] = ri
 
-        # 3. Agrupar por componente
         groups: dict[int, list[str]] = {}
         for idx, name in enumerate(all_names):
             groups.setdefault(_find(idx), []).append(name)
 
-        # 4. Elegir nombre canónico global por grupo.
-        #    Criterio (por prioridad):
-        #    a) Frecuencia: cuántos relatos usan este nombre como canónico.
-        #       El más frecuente es el más "estable" en el corpus.
-        #    b) Nombre desnudo (sin títulos honoríficos).
-        #    c) Más tokens en el nombre desnudo (más descriptivo).
-        #    d) Orden alfabético como desempate final.
         name_frequency: dict[str, int] = {}
         for result in all_results.values():
             for char in result["entities"].get("characters", []):
@@ -1324,10 +1045,9 @@ Only extract relationships that are explicitly supported by the text. Include th
              {rename_map[n]: n for n in rename_map}.items()},
         )
 
-        # 5. Aplicar rename_map a cada resultado
         updated: dict[str, dict] = {}
         for story_title, result in all_results.items():
-            # -- Characters: renombrar y deduplicar fusionados --
+
             renamed_chars: dict[str, dict] = {}
             for char in result["entities"].get("characters", []):
                 old_name = char["name"]
@@ -1335,28 +1055,26 @@ Only extract relationships that are explicitly supported by the text. Include th
                 if new_name not in renamed_chars:
                     renamed_chars[new_name] = dict(char)
                     renamed_chars[new_name]["name"] = new_name
-                # Fusionar aliases si el canónico ya existía en este relato
+
                 existing = renamed_chars[new_name]
                 merged_aliases: list[str] = list({
                     *existing.get("aliases", []),
                     *char.get("aliases", []),
                     *([] if old_name == new_name else [old_name]),
                 })
-                # Excluir el propio nombre canónico de los aliases
+
                 merged_aliases = [a for a in merged_aliases if a != new_name]
                 existing["aliases"] = sorted(merged_aliases)
 
             new_entities = dict(result["entities"])
             new_entities["characters"] = list(renamed_chars.values())
 
-            # -- Relationships: renombrar source y target --
             new_rels = []
             for rel in result.get("relationships", []):
                 src = rename_map.get(rel["source_name"], rel["source_name"])
                 tgt = rename_map.get(rel["target_name"], rel["target_name"])
                 new_rels.append({**rel, "source_name": src, "target_name": tgt})
 
-            # -- chunk_entities: renombrar nombres de entidades en MENTIONS --
             new_chunk_entities = []
             for ce in result.get("chunk_entities", []):
                 renamed_entity_names = [

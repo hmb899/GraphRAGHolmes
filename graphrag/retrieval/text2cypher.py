@@ -1,5 +1,3 @@
-"""Conversión de lenguaje natural a Cypher usando Gemini (Text2Cypher)."""
-
 import logging
 from typing import Any
 
@@ -73,38 +71,30 @@ class Text2CypherRetriever:
                 "question": "¿Qué objetos se encontraron en alguna ubicación?",
                 "cypher": "MATCH (o:Object)-[:FOUND_AT]->(l:Location) RETURN o.name AS object, o.type AS type, l.name AS location ORDER BY l.name",
             },
-            # ── Patrones adicionales cubiertos por los siguientes ejemplos ────────
-            # COUNT sobre Deduction via story_title property — alias incluye el relato
             {
                 "question": "How many deductions does Holmes make in The Red-Headed League?",
                 "cypher": "MATCH (d:Deduction) WHERE toLower(d.story_title) CONTAINS toLower('red-headed league') RETURN d.story_title AS story, count(d) AS deductions_in_story",
             },
-            # Filtro por tipo de Crime — alias deja claro que son relatos con asesinato
             {
                 "question": "In which stories do crimes of type murder appear?",
                 "cypher": "MATCH (cr:Crime) WHERE toLower(cr.type) CONTAINS 'murder' RETURN DISTINCT cr.story_title AS story_with_murder_crime ORDER BY cr.story_title",
             },
-            # USES en inglés (Holmes) — alias indica quién usa los objetos
             {
                 "question": "What objects does Sherlock Holmes use?",
                 "cypher": "MATCH (c:Character)-[:USES]->(o:Object) WHERE toLower(c.name) CONTAINS 'holmes' RETURN DISTINCT o.name AS object_used_by_holmes, o.type AS type ORDER BY o.name",
             },
-            # APPEARS_IN con CONTAINS — alias indica de quién son los relatos
             {
                 "question": "In which stories does Watson appear?",
                 "cypher": "MATCH (c:Character)-[:APPEARS_IN]->(s:Story) WHERE toLower(c.name) CONTAINS 'watson' RETURN DISTINCT s.title AS story_featuring_watson ORDER BY s.title",
             },
-            # Multi-hop COUNT DISTINCT — alias indica personaje y cuántos relatos
             {
                 "question": "Which characters know Holmes AND appear in more than one story?",
                 "cypher": "MATCH (c:Character)-[:KNOWS]->(h:Character {name: 'Sherlock Holmes'}), (c)-[:APPEARS_IN]->(s:Story) WITH c, count(DISTINCT s) AS story_count WHERE story_count > 1 RETURN c.name AS character_knowing_holmes, story_count ORDER BY story_count DESC",
             },
-            # Multi-hop INVESTIGATES + APPEARS_IN — alias indica qué hace el personaje
             {
                 "question": "Which characters investigate crimes and appear in more than one story?",
                 "cypher": "MATCH (c:Character)-[:INVESTIGATES]->(cr:Crime), (c)-[:APPEARS_IN]->(s:Story) WITH c, count(DISTINCT s) AS story_count WHERE story_count > 1 RETURN DISTINCT c.name AS character_investigates_crimes, story_count ORDER BY c.name",
             },
-            # Cadena LEADS_TO entre deducciones — alias indica el flujo lógico
             {
                 "question": "What is the deduction chain in The Adventure of the Speckled Band?",
                 "cypher": "MATCH (d1:Deduction)-[:LEADS_TO]->(d2:Deduction) WHERE toLower(d1.story_title) CONTAINS toLower('speckled band') RETURN d1.conclusion AS deduction_leads_from, d2.conclusion AS deduction_leads_to ORDER BY d1.id",
@@ -112,7 +102,6 @@ class Text2CypherRetriever:
         ]
 
         self.terminology_mappings: dict[str, str] = {
-            # Nodos
             "personaje": "Character",
             "personajes": "Character",
             "character": "Character",
@@ -141,7 +130,6 @@ class Text2CypherRetriever:
             "evento": "Event",
             "acontecimiento": "Event",
             "fragmento": "Chunk",
-            # Relaciones
             "aparece en": "APPEARS_IN",
             "conoce a": "KNOWS",
             "investiga": "INVESTIGATES",
@@ -149,12 +137,10 @@ class Text2CypherRetriever:
             "vive en": "LIVES_AT",
             "ocurre en": "OCCURS_IN",
             "participa en": "PARTICIPATES_IN",
-            # Propiedades
             "colección": "collection (property of Story)",
             "nombre": "name",
             "descripción": "description",
             "tipo": "type",
-            # Valores de colección
             "Adventures": "The Adventures of Sherlock Holmes",
             "Memoirs": "The Memoirs of Sherlock Holmes",
             "Return": "The Return of Sherlock Holmes",
@@ -165,17 +151,7 @@ class Text2CypherRetriever:
         self.few_shot_examples.append({"question": question, "cypher": cypher})
 
     def generate_cypher(self, question: str) -> str:
-        """Genera una query Cypher a partir de una pregunta en lenguaje natural.
-
-        Usa el esquema real del grafo y ejemplos few-shot para guiar la generación.
-        Emplea structured_output para garantizar que el LLM devuelve Cypher puro.
-
-        Args:
-            question: Pregunta en lenguaje natural (español o inglés).
-
-        Returns:
-            Query Cypher lista para ejecutar, sin backticks ni markdown.
-        """
+        """Genera una query Cypher a partir de una pregunta en lenguaje natural."""
         schema = self.neo4j.get_schema()
         schema_str = Neo4jManager.format_schema(schema)
 
@@ -244,15 +220,7 @@ class Text2CypherRetriever:
         return cypher
 
     def retrieve(self, question: str) -> tuple[str, list[dict[str, Any]]]:
-        """Genera una query Cypher y la ejecuta contra Neo4j.
-
-        Args:
-            question: Pregunta en lenguaje natural.
-
-        Returns:
-            Tupla (cypher_query, resultados). Si la ejecución falla,
-            devuelve (cypher_query, []) y registra el error.
-        """
+        """Genera una query Cypher y la ejecuta contra Neo4j."""
         cypher = self.generate_cypher(question)
         try:
             results = self.neo4j.execute_query(cypher)
@@ -261,29 +229,12 @@ class Text2CypherRetriever:
             logger.error("Error ejecutando Cypher: %s\nQuery: %s", exc, cypher)
             return cypher, []
 
-    def retrieve_with_retry(
-        self,
-        question: str,
-        max_retries: int = 2,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """Genera y ejecuta una query Cypher con reintentos ante fallos de ejecución.
-
-        Si la query generada provoca un error en Neo4j, el error se incluye como
-        feedback en el siguiente intento para que el LLM corrija la query.
-        No reintenta cuando los resultados son simplemente una lista vacía legítima.
-
-        Args:
-            question: Pregunta en lenguaje natural.
-            max_retries: Número máximo de reintentos tras el primer intento.
-
-        Returns:
-            Tupla (cypher_query, resultados) del intento más exitoso.
-        """
+    def retrieve_with_retry(self, question: str, max_retries: int = 2) -> tuple[str, list[dict[str, Any]]]:
+        """Genera y ejecuta una query Cypher; si falla, reintenta con el error como feedback al LLM."""
         current_question = question
         last_cypher = ""
 
         for attempt in range(max_retries + 1):
-            # Generación (puede fallar si el LLM devuelve algo inválido)
             try:
                 last_cypher = self.generate_cypher(current_question)
             except Exception as exc:
@@ -298,7 +249,6 @@ class Text2CypherRetriever:
                 )
                 continue
 
-            # Ejecución
             try:
                 results = self.neo4j.execute_query(last_cypher)
                 if attempt > 0:

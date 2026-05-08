@@ -1,5 +1,3 @@
-"""Recuperador basado en búsqueda fulltext."""
-
 import logging
 from typing import Any
 
@@ -16,21 +14,8 @@ class FullTextRetriever:
         self.neo4j = neo4j_manager
         self.settings = get_settings()
 
-    def retrieve(
-        self,
-        query: str,
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Recupera chunks cuyo texto contiene las palabras clave de la query.
-
-        Args:
-            query: Texto de la consulta (sintaxis Lucene soportada por Neo4j fulltext).
-            top_k: Número máximo de resultados. Por defecto settings.top_k_results.
-
-        Returns:
-            Lista de dicts con keys: text, chunk_id, chunk_index, position,
-            story_title, collection, score.
-        """
+    def retrieve(self, query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+        """Recupera chunks cuyo texto contiene las palabras clave de la query."""
         top_k = top_k or self.settings.top_k_results
 
         cypher = """

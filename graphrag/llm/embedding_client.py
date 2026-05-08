@@ -1,5 +1,3 @@
-"""Cliente de Ollama para generación de embeddings."""
-
 import ollama
 from tqdm import tqdm
 
@@ -28,7 +26,5 @@ class EmbeddingClient:
         return embeddings
 
     def embed_single(self, text: str) -> list[float]:
-        """
-        Genera el embedding de un único texto.
-        """
+        """Genera el embedding de un único texto."""
         return self.embed([text])[0]

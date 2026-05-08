@@ -1,5 +1,3 @@
-"""Gestión de conexión y operaciones CRUD en Neo4j."""
-
 import logging
 import re
 from typing import Any
@@ -78,11 +76,7 @@ class Neo4jManager:
         """Cierra la conexión con Neo4j."""
         self.driver.close()
 
-    def execute_query(
-        self,
-        query: str,
-        parameters: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
+    def execute_query(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Ejecuta una consulta Cypher y devuelve los resultados."""
         with self.driver.session() as session:
             result = session.run(query, parameters or {})
@@ -183,7 +177,6 @@ class Neo4jManager:
         """Almacena todas las entidades extraídas de un relato en Neo4j."""
         story_id = _sanitize_id(story_title)
 
-        # Characters MERGE por nombre + relación APPEARS_IN
         for char in entities.get("characters", []):
             try:
                 self.execute_query(
@@ -207,7 +200,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Character '%s': %s", char.get("name"), exc)
 
-        # Locations MERGE por nombre
         for loc in entities.get("locations", []):
             try:
                 self.execute_query(
@@ -225,7 +217,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Location '%s': %s", loc.get("name"), exc)
 
-        # Crimes → MERGE por name (único dentro de cada relato por diseño del LLM)
         for i, crime in enumerate(entities.get("crimes", [])):
             crime_name = crime.get("name", "") or f"{story_id}_crime_{i}"
             try:
@@ -248,7 +239,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Crime '%s': %s", crime_name, exc)
 
-        # Objects MERGE por nombre (pueden compartirse entre relatos)
         for obj in entities.get("objects", []):
             try:
                 self.execute_query(
@@ -266,7 +256,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Object '%s': %s", obj.get("name"), exc)
 
-        # Deductions CREATE con id único (no tienen nombre canónico)
         for i, ded in enumerate(entities.get("deductions", [])):
             ded_id = f"{story_id}_deduction_{i}"
             try:
@@ -291,7 +280,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Deduction %s: %s", ded_id, exc)
 
-        # Scenes id único + relación BELONGS_TO con el Story
         for i, scene in enumerate(entities.get("scenes", [])):
             scene_id = f"{story_id}_scene_{i}"
             try:
@@ -316,7 +304,6 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Scene %s: %s", scene_id, exc)
 
-        # Events id compuesto para evitar colisiones entre relatos
         for i, event in enumerate(entities.get("events", [])):
             event_id = f"{story_id}_event_{i}"
             try:
@@ -337,16 +324,8 @@ class Neo4jManager:
             except Exception as exc:
                 logger.error("Error almacenando Event %s: %s", event_id, exc)
 
-    def store_relationships(
-        self, relationships: list[dict], story_title: str = ""
-    ) -> None:
-        """Crea las relaciones entre entidades en Neo4j.
-
-        Args:
-            relationships: Lista de relaciones extraídas.
-            story_title: Título del relato, usado para acotar el fuzzy matching
-                         de escenas y eventos al relato correcto.
-        """
+    def store_relationships(self, relationships: list[dict], story_title: str = "") -> None:
+        """Crea las relaciones entre entidades en Neo4j."""
         # Pre-cargar títulos de Scene y Event del relato para fuzzy matching.
         # Acotar por story_title evita que una escena de otro relato con nombre
         # similar absorba la relación equivocada.
@@ -410,7 +389,7 @@ class Neo4jManager:
             target = rel.get("target_name", "")
             props = rel.get("properties", {})
 
-            # BASED_ON: Deduction → Object | Event | Character | Crime | Location
+            # BASED_ON: Deduction, Object | Event | Character | Crime | Location
             # Se maneja con query multi-etiqueta porque el LLM enlaza deducciones
             # con cualquier tipo de entidad, no solo Object.
             if rel_type == "BASED_ON":
@@ -440,7 +419,6 @@ class Neo4jManager:
 
             src_label, tgt_label, src_key, tgt_key = spec
 
-            # Fuzzy matching para Scene
             if rel_type in _SCENE_REL_TYPES and scene_titles:
                 if src_label == "Scene" and src_key == "title":
                     matched = _fuzzy_match(source, scene_titles)
@@ -453,7 +431,6 @@ class Neo4jManager:
                         logger.debug("Fuzzy Scene tgt: %r -> %r", target, matched)
                         target = matched
 
-            # Fuzzy matching para Event
             if rel_type in _EVENT_REL_TYPES and event_names:
                 if tgt_label == "Event" and tgt_key == "name":
                     matched = _fuzzy_match(target, event_names)
@@ -461,7 +438,6 @@ class Neo4jManager:
                         logger.debug("Fuzzy Event tgt: %r -> %r", target, matched)
                         target = matched
 
-            # Fuzzy matching para Location (umbral más alto para evitar falsos positivos)
             if rel_type in _LOCATION_REL_TYPES and location_names:
                 if tgt_label == "Location" and tgt_key == "name":
                     matched = _fuzzy_match(target, location_names, threshold=0.55)
@@ -540,8 +516,6 @@ class Neo4jManager:
         )
         return {row["label"]: row["count"] for row in rows if row["label"]}
 
-    # Schema (clase a cambiar)
-
     def get_schema(self) -> dict[str, Any]:
         """Obtiene el esquema del grafo (nodos, propiedades y relaciones)."""
         node_props_query = """
@@ -583,14 +557,7 @@ class Neo4jManager:
 
     @staticmethod
     def format_schema(schema: dict[str, Any]) -> str:
-        """Formatea el schema del grafo como texto para usar en prompts LLM.
-
-        Args:
-            schema: Dict devuelto por get_schema().
-
-        Returns:
-            String con nodos, propiedades y relaciones en formato legible.
-        """
+        """Formatea el schema del grafo como texto para usar en prompts LLM."""
         def _fmt_props(props: list[dict]) -> str:
             return ", ".join(f"{p['property']}: {p['type']}" for p in props)
 
