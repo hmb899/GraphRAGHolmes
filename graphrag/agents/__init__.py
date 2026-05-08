@@ -2,6 +2,8 @@
 
 from typing import Any
 
+_MAX_CONTEXT_CHARS = 12_000
+
 from ..graph.neo4j_manager import Neo4jManager
 from ..llm.gemini_client import GeminiClient, ModelTier
 from .answer_critic import AnswerCritic
@@ -176,6 +178,8 @@ class AgenticRAG:
         context_str = "\n\n".join(
             f"[{i + 1}] {chunk}" for i, chunk in enumerate(context)
         )
+        if len(context_str) > _MAX_CONTEXT_CHARS:
+            context_str = context_str[:_MAX_CONTEXT_CHARS] + "\n[context truncated]"
 
         if current_question != original_question:
             prompt = (

@@ -73,6 +73,42 @@ class Text2CypherRetriever:
                 "question": "¿Qué objetos se encontraron en alguna ubicación?",
                 "cypher": "MATCH (o:Object)-[:FOUND_AT]->(l:Location) RETURN o.name AS object, o.type AS type, l.name AS location ORDER BY l.name",
             },
+            # ── Patrones adicionales cubiertos por los siguientes ejemplos ────────
+            # COUNT sobre Deduction via story_title property — alias incluye el relato
+            {
+                "question": "How many deductions does Holmes make in The Red-Headed League?",
+                "cypher": "MATCH (d:Deduction) WHERE toLower(d.story_title) CONTAINS toLower('red-headed league') RETURN d.story_title AS story, count(d) AS deductions_in_story",
+            },
+            # Filtro por tipo de Crime — alias deja claro que son relatos con asesinato
+            {
+                "question": "In which stories do crimes of type murder appear?",
+                "cypher": "MATCH (cr:Crime) WHERE toLower(cr.type) CONTAINS 'murder' RETURN DISTINCT cr.story_title AS story_with_murder_crime ORDER BY cr.story_title",
+            },
+            # USES en inglés (Holmes) — alias indica quién usa los objetos
+            {
+                "question": "What objects does Sherlock Holmes use?",
+                "cypher": "MATCH (c:Character)-[:USES]->(o:Object) WHERE toLower(c.name) CONTAINS 'holmes' RETURN DISTINCT o.name AS object_used_by_holmes, o.type AS type ORDER BY o.name",
+            },
+            # APPEARS_IN con CONTAINS — alias indica de quién son los relatos
+            {
+                "question": "In which stories does Watson appear?",
+                "cypher": "MATCH (c:Character)-[:APPEARS_IN]->(s:Story) WHERE toLower(c.name) CONTAINS 'watson' RETURN DISTINCT s.title AS story_featuring_watson ORDER BY s.title",
+            },
+            # Multi-hop COUNT DISTINCT — alias indica personaje y cuántos relatos
+            {
+                "question": "Which characters know Holmes AND appear in more than one story?",
+                "cypher": "MATCH (c:Character)-[:KNOWS]->(h:Character {name: 'Sherlock Holmes'}), (c)-[:APPEARS_IN]->(s:Story) WITH c, count(DISTINCT s) AS story_count WHERE story_count > 1 RETURN c.name AS character_knowing_holmes, story_count ORDER BY story_count DESC",
+            },
+            # Multi-hop INVESTIGATES + APPEARS_IN — alias indica qué hace el personaje
+            {
+                "question": "Which characters investigate crimes and appear in more than one story?",
+                "cypher": "MATCH (c:Character)-[:INVESTIGATES]->(cr:Crime), (c)-[:APPEARS_IN]->(s:Story) WITH c, count(DISTINCT s) AS story_count WHERE story_count > 1 RETURN DISTINCT c.name AS character_investigates_crimes, story_count ORDER BY c.name",
+            },
+            # Cadena LEADS_TO entre deducciones — alias indica el flujo lógico
+            {
+                "question": "What is the deduction chain in The Adventure of the Speckled Band?",
+                "cypher": "MATCH (d1:Deduction)-[:LEADS_TO]->(d2:Deduction) WHERE toLower(d1.story_title) CONTAINS toLower('speckled band') RETURN d1.conclusion AS deduction_leads_from, d2.conclusion AS deduction_leads_to ORDER BY d1.id",
+            },
         ]
 
         self.terminology_mappings: dict[str, str] = {
@@ -174,6 +210,20 @@ class Text2CypherRetriever:
             "10. Deduction nodes are identified by their 'observation' text (not a 'name' property).\n"
             "11. Scene nodes use 'title' as their display name; Story nodes also use 'title'.\n"
             "12. Story titles are stored with Python title-case (every word capitalised, e.g. 'A Scandal In Bohemia', 'The Adventure Of The Speckled Band'). Always match them with toLower(s.title) = toLower('...') to handle user input variations.\n"
+            "13. Deduction and Crime nodes link to their story via a 'story_title' STRING PROPERTY, NOT via a relationship. "
+            "Never write MATCH (c:Character)-[...]->(d:Deduction). "
+            "Always use: MATCH (d:Deduction) WHERE toLower(d.story_title) CONTAINS toLower('...').\n"
+            "14. For multi-hop queries that count appearances ('appear in more than one story', 'appear in multiple stories'), "
+            "always use WITH + count(DISTINCT s) AFTER the MATCH, then filter with WHERE: "
+            "MATCH (c)-[:REL1]->(), (c)-[:APPEARS_IN]->(s:Story) WITH c, count(DISTINCT s) AS n WHERE n > 1 RETURN ...\n"
+            "15. NEVER use exact name matching ({name: 'Watson'}, {name: 'Dr. Watson'}) for secondary characters — "
+            "their stored name may vary. Always use toLower(c.name) CONTAINS 'watson'. "
+            "Exact match {name: 'Sherlock Holmes'} is only safe for Holmes himself.\n"
+            "16. Use DESCRIPTIVE RETURN aliases that carry full context to the answer generator. "
+            "BAD: RETURN count(d) AS total — the LLM cannot tell what 'total' refers to. "
+            "GOOD: RETURN d.story_title AS story, count(d) AS deductions_in_story — the LLM sees both the story and the count. "
+            "BAD: RETURN cr.story_title AS story_title — 'story_title' alone loses the crime context. "
+            "GOOD: RETURN DISTINCT cr.story_title AS story_with_murder_crime — the alias preserves the filter semantics.\n"
         )
 
         result = self.client.structured_output(

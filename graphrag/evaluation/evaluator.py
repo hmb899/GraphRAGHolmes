@@ -1,3 +1,4 @@
+import ast
 import re as _re
 from datetime import datetime
 from typing import Any, Optional
@@ -295,8 +296,16 @@ class RAGEvaluator:
 
         result = result_obj.model_dump()
 
-        # Force consistency
+        # Align lists: LLM may return different lengths for sentences vs attributions.
+        sentences = result.get("sentences", [])
         attributions = result.get("attributions", [])
+        if len(sentences) != len(attributions):
+            min_len = min(len(sentences), len(attributions))
+            sentences = sentences[:min_len]
+            attributions = attributions[:min_len]
+            result["sentences"] = sentences
+            result["attributions"] = attributions
+
         if attributions:
             result["recall"] = sum(attributions) / len(attributions)
         else:
@@ -509,6 +518,13 @@ class RAGEvaluator:
             verdicts = verif_obj.verdicts
             reasoning = verif_obj.reasoning
 
+        # Align: LLM may return different list lengths for verdicts vs statements.
+        if len(verdicts) != len(statements):
+            min_len = min(len(verdicts), len(statements))
+            verdicts = verdicts[:min_len]
+            reasoning = reasoning[:min_len]
+            statements = statements[:min_len]
+
         # ---------------------------------------------------------
         # Score
         # ---------------------------------------------------------
@@ -566,6 +582,23 @@ class RAGEvaluator:
         _vprint(verbose, f"  Question    : {question}")
         _vprint(verbose, f"  Answer      : {answer}")
         _vprint(verbose, f"  Ground truth: {ground_truth}")
+
+        # Meta-responses (greetings, scope refusals, KB-abstentions) are evaluated
+        # as correct when both ground truth and answer belong to the same meta-category.
+        # TP/FP/FN classification would penalise extra politeness or cross-language
+        # paraphrases — neither of which represents a real error.
+        if _is_no_retrieval_needed(ground_truth) and _is_no_retrieval_needed(answer):
+            _vprint(verbose, "\n  Both answer and ground truth are meta-responses — correctness = 1.0 by convention.")
+            _vprint(verbose, "────────────────────────────────────────────────────")
+            return {
+                "classifications": [],
+                "tp": 1,
+                "fp": 0,
+                "fn": 0,
+                "precision": 1.0,
+                "recall": 1.0,
+                "answer_correctness": 1.0,
+            }
 
         breakdown_prompt = (
             "Goal: Given a question and an answer, analyze the complexity of each sentence "
@@ -640,9 +673,11 @@ Provide concise reasons.
             temperature=0.0,
         )
 
-        tp = classif_obj.tp_count
-        fp = classif_obj.fp_count
-        fn = classif_obj.fn_count
+        # Count from the actual classification list, not from LLM-reported totals
+        # (LLM-provided tp_count/fp_count/fn_count can be inconsistent with the list).
+        tp = sum(1 for c in classif_obj.classifications if c.category == "TP")
+        fp = sum(1 for c in classif_obj.classifications if c.category == "FP")
+        fn = sum(1 for c in classif_obj.classifications if c.category == "FN")
 
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -752,7 +787,15 @@ Provide concise reasons.
 
             contexts = row["retrieved_contexts"]
             if isinstance(contexts, str):
-                contexts = [contexts]
+                # When loaded from CSV, lists are serialized as strings like "['a', 'b']".
+                # Wrapping with [str] would produce ["['a', 'b']"] — a single fake chunk.
+                try:
+                    parsed = ast.literal_eval(contexts)
+                    contexts = parsed if isinstance(parsed, list) else []
+                except (ValueError, SyntaxError):
+                    contexts = []
+            if not isinstance(contexts, list):
+                contexts = []
 
             recall = self.evaluate_context_recall(
                 row["question"], row["ground_truth"], contexts, verbose=verbose

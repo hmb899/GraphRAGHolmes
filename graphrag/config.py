@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 768
 
     # Procesamiento
-    top_k_results: int = 5
+    top_k_results: int = 10
     batch_size: int = 10
 
     # Paths

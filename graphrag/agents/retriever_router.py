@@ -22,6 +22,7 @@ class RouterDecision(BaseModel):
         "text2cypher",
         "greeting",
         "out_of_scope",
+        "skills",
     ] = Field(
         ...,
         description="Nombre de la herramienta seleccionada para manejar la consulta.",
@@ -75,14 +76,14 @@ class RetrieverRouter:
             "Select the single best tool for the user's question.\n\n"
             f"Available tools:\n{tools_str}\n\n"
             "ROUTING RULES — apply in order:\n\n"
-            "1. greeting     — Use when the message is conversational and needs NO knowledge lookup:\n"
-            "   greetings (\"Hello\", \"Hola\", \"Buenos días\"), farewells (\"Goodbye\", \"Adiós\"),\n"
-            "   thanks (\"Gracias\", \"Thank you\"),\n"
-            "   questions about the system (\"What can you do?\", \"¿Qué puedes hacer?\", \"¿Cómo funcionas?\").\n\n"
-            "2. out_of_scope — Use when the question is clearly unrelated to Sherlock Holmes stories:\n"
+            "1. greeting     — Use for purely conversational messages: greetings, farewells, thanks.\n"
+            "   Examples: \"Hello\", \"Hola\", \"Buenos días\", \"Goodbye\", \"Adiós\", \"Gracias\", \"Thank you\".\n\n"
+            "2. skills       — Use when the user explicitly asks what the system can do or help with.\n"
+            "   Examples: \"What can you do?\", \"¿Qué puedes hacer?\", \"¿Cómo funcionas?\", \"Help\".\n\n"
+            "3. out_of_scope — Use when the question is clearly unrelated to Sherlock Holmes stories:\n"
             "   weather, sports, cooking, politics, current events, other fictional universes.\n"
             "   Examples: \"What is the capital of France?\", \"¿Quién ganó el Mundial?\".\n\n"
-            "3. text2cypher   — Use for STRUCTURED data queries that need graph traversal:\n"
+            "4. text2cypher   — Use for STRUCTURED data queries that need graph traversal:\n"
             "   - Counts: \"¿Cuántos personajes aparecen en...?\", \"How many crimes...\"\n"
             "   - Enumerations: \"Lista todos los...\", \"List all characters who...\"\n"
             "   - Specific attributes: \"¿Cuál es la ocupación de...?\"\n"
@@ -90,18 +91,19 @@ class RetrieverRouter:
             "   - Location of scenes or events: \"What happens at X?\", \"What scenes take place at X?\", \"¿Qué ocurre en X?\" (uses TAKES_PLACE_IN — NOT answerable from text chunks)\n"
             "   - Relationships: \"¿A quién conoce Holmes?\", \"What crimes does X investigate?\"\n"
             "   - Aggregations: \"¿Cuántos relatos hay por colección?\"\n"
-            "   - Comparisons: \"¿Qué personajes aparecen en más de un relato?\"\n\n"
-            "4. vector_search — Use for DESCRIPTIVE or CONCEPTUAL questions answerable from text passages:\n"
+            "   - Comparisons: \"¿Qué personajes aparecen en más de un relato?\"\n"
+            "   - Deduction chains and reasoning sequences: \"What deduction chain does Holmes build in X?\", \"What is the reasoning chain in X?\", \"¿Cuál es la cadena de deducciones en X?\" (uses LEADS_TO relationship between Deduction nodes — NOT answerable from text chunks)\n\n"
+            "5. vector_search — Use for DESCRIPTIVE or CONCEPTUAL questions answerable from text passages:\n"
             "   \"¿Cómo resuelve Holmes el caso?\", \"Describe the relationship between Holmes and Watson\",\n"
             "   \"¿Qué método usa Holmes para...?\", \"Explain Holmes' deduction about...\".\n\n"
-            "5. fulltext_search — Use when the user wants to find EXACT mentions or specific terms:\n"
+            "6. fulltext_search — Use when the user wants to find EXACT mentions or specific terms:\n"
             "   \"¿Dónde se menciona 'strychnine'?\", \"Find passages about 'the red-headed league'\",\n"
             "   quoted search terms, proper nouns the user wants to locate verbatim in the text.\n\n"
-            "6. hybrid_search — Use when BOTH semantic meaning AND specific keywords matter:\n"
+            "7. hybrid_search — Use when BOTH semantic meaning AND specific keywords matter:\n"
             "   \"Holmes' analysis of the speckled band\", \"Watson's description of Irene Adler\".\n"
             "   Also use as a FALLBACK when unsure between vector_search and fulltext_search.\n\n"
             "IMPORTANT:\n"
-            "- Choose greeting or out_of_scope FIRST before considering any retrieval tool.\n"
+            "- Choose greeting, skills, or out_of_scope FIRST before considering any retrieval tool.\n"
             "- Prefer text2cypher for anything countable, listable, or involving graph relationships.\n"
             "- Prefer vector_search for open-ended, descriptive, or 'how/why' questions.\n"
             "- Use fulltext_search only when the user explicitly wants keyword-exact matches.\n"
