@@ -1,5 +1,3 @@
-"""Orquestador agéntico principal del sistema GraphRAGHolmes."""
-
 from typing import Any
 
 _MAX_CONTEXT_CHARS = 12_000
@@ -39,7 +37,7 @@ _AUTO_PASS_CRITIQUE: dict[str, Any] = {
 class AgenticRAG:
     """Orquestador del sistema agéntico de RAG para Sherlock Holmes.
 
-    Coordina el flujo: routing → retrieval → generación → critique → retry.
+    Coordina el flujo, routing, retrieval, generación, critique, retry.
     """
 
     def __init__(self, neo4j_manager: Neo4jManager) -> None:
@@ -51,31 +49,13 @@ class AgenticRAG:
         self.conversation_history: list[dict[str, str]] = []
 
     def answer(self, question: str, max_iterations: int = 3) -> dict[str, Any]:
-        """Responde una pregunta usando el flujo agéntico completo.
-
-        Flujo por iteración:
-          1. Router decide qué retriever usar.
-          2. El retriever recupera contexto.
-          3. El LLM genera una respuesta a partir del contexto.
-          4. El Critic evalúa completitud y fidelidad.
-          5. Si la respuesta no es satisfactoria, se refina la pregunta con las
-             sub-preguntas del Critic y se itera de nuevo (hasta max_iterations).
-
-        Args:
-            question: Pregunta del usuario en lenguaje natural.
-            max_iterations: Número máximo de iteraciones de refinamiento.
-
-        Returns:
-            Dict con keys: question, answer, iterations, final_critique,
-            total_iterations.
-        """
+        """Responde una pregunta con el flujo, routing, retrieval, generación, critique, retry."""
         iterations: list[dict[str, Any]] = []
         current_question = question
         answer = _NO_CONTEXT_ANSWER
 
         for iteration in range(max_iterations):
 
-            # 1. Routing + retrieval
             retrieval_result = self.router.retrieve(
                 current_question, self.conversation_history
             )
@@ -88,7 +68,6 @@ class AgenticRAG:
                 else {}
             )
 
-            # 2a. Respuesta directa (greeting / out_of_scope / skills)
             if "direct_response" in retrieval_result:
                 answer = retrieval_result["direct_response"]
                 iterations.append({
@@ -103,7 +82,7 @@ class AgenticRAG:
 
             context = retrieval_result.get("context", [])
 
-            # 2b. Sin contexto → abstención legítima (no hallucinar)
+            # Sin contexto → abstención, no hallucinar
             if not context:
                 answer = _NO_CONTEXT_ANSWER
                 iterations.append({
@@ -116,10 +95,7 @@ class AgenticRAG:
                 })
                 break
 
-            # 2c. Generar respuesta a partir del contexto
             answer = self._generate_answer(question, current_question, context)
-
-            # 3. Evaluar respuesta con el Critic
             critique = self.critic.critique(current_question, context, answer)
 
             iterations.append({
@@ -131,7 +107,6 @@ class AgenticRAG:
                 "critique": critique,
             })
 
-            # 4. Decisión: continuar o terminar
             if critique["is_complete"] and critique["is_faithful"]:
                 break
 
@@ -143,7 +118,6 @@ class AgenticRAG:
                     f"{question}\n\nAdditional aspects to cover: {sub_questions}"
                 )
 
-        # Actualizar historial de conversación multi-turno
         self.conversation_history.append({"role": "user", "content": question})
         self.conversation_history.append({"role": "assistant", "content": answer})
 
@@ -155,26 +129,8 @@ class AgenticRAG:
             "total_iterations": len(iterations),
         }
 
-    def _generate_answer(
-        self,
-        original_question: str,
-        current_question: str,
-        context: list[str],
-    ) -> str:
-        """Genera una respuesta a partir del contexto recuperado.
-
-        Cuando la pregunta ha sido refinada respecto a la original, incluye
-        ambas en el prompt para que el LLM no pierda el foco de la pregunta
-        que el usuario realmente hizo.
-
-        Args:
-            original_question: Pregunta tal como la escribió el usuario.
-            current_question: Pregunta (posiblemente refinada) usada en esta iteración.
-            context: Fragmentos de texto recuperados como contexto.
-
-        Returns:
-            Respuesta generada por el LLM.
-        """
+    def _generate_answer(self, original_question: str, current_question: str, context: list[str]) -> str:
+        """Genera una respuesta a partir del contexto; incluye la pregunta original cuando ha sido refinada."""
         context_str = "\n\n".join(
             f"[{i + 1}] {chunk}" for i, chunk in enumerate(context)
         )
