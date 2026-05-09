@@ -1,5 +1,3 @@
-"""Crítico de respuestas para el sistema agéntico de RAG."""
-
 import logging
 from typing import Any
 
@@ -67,17 +65,7 @@ class AnswerCritic:
     def critique(
         self, question: str, context: list[str], answer: str
     ) -> dict[str, Any]:
-        """Evalúa si la respuesta es completa y fiel al contexto recuperado.
-
-        Args:
-            question: Pregunta original del usuario.
-            context: Lista de fragmentos de texto recuperados como contexto.
-            answer: Respuesta generada que se va a evaluar.
-
-        Returns:
-            Dict con keys: is_complete (bool), is_faithful (bool),
-            missing_info (list[str]), feedback (str).
-        """
+        """Evalúa si la respuesta es completa y fiel al contexto recuperado."""
         context_str = (
             "\n\n".join(f"[{i + 1}] {chunk}" for i, chunk in enumerate(context))
             if context
@@ -101,29 +89,12 @@ class AnswerCritic:
         return result.model_dump()
 
     def should_retry(self, critique: dict[str, Any]) -> bool:
-        """Determina si se debe lanzar otra iteración de retrieval.
-
-        Solo reintenta si la respuesta es incompleta Y hay sub-preguntas
-        concretas con las que buscar información adicional.
-
-        Args:
-            critique: Dict devuelto por critique().
-
-        Returns:
-            True si se debe relanzar retrieval, False en caso contrario.
-        """
+        """True si la respuesta es incompleta y hay sub-preguntas para relanzar retrieval."""
         return (
             not critique.get("is_complete", True)
             and bool(critique.get("missing_info"))
         )
 
     def get_retry_queries(self, critique: dict[str, Any]) -> list[str]:
-        """Extrae las sub-preguntas del critique para relanzar retrieval.
-
-        Args:
-            critique: Dict devuelto por critique().
-
-        Returns:
-            Lista de sub-preguntas (puede estar vacía).
-        """
+        """Extrae las sub-preguntas del critique para relanzar retrieval."""
         return critique.get("missing_info", [])

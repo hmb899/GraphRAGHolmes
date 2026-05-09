@@ -1,5 +1,3 @@
-"""Plantillas Cypher parametrizadas para consultas recurrentes del dominio Sherlock Holmes."""
-
 import logging
 import re
 from typing import Any
@@ -11,22 +9,13 @@ logger = logging.getLogger(__name__)
 
 
 class ManualRetriever:
-    """Ejecuta consultas Cypher predefinidas y parametrizadas para el dominio Holmes.
-
-    A diferencia de Text2CypherRetriever, estas queries están escritas a mano,
-    probadas y garantizan resultados correctos para los patrones de pregunta más
-    frecuentes. No requieren ningún LLM.
-    """
+    """Ejecuta consultas Cypher predefinidas y parametrizadas para el dominio Holmes."""
 
     def __init__(self, neo4j_manager: Neo4jManager) -> None:
         self.neo4j = neo4j_manager
         self.settings = get_settings()
         self.queries: dict[str, dict[str, Any]] = {}
         self._register_default_queries()
-
-    # ------------------------------------------------------------------
-    # Registro de plantillas
-    # ------------------------------------------------------------------
 
     def _register_default_queries(self) -> None:
         """Carga las 10 plantillas Cypher por defecto del dominio Sherlock Holmes."""
@@ -173,23 +162,9 @@ class ManualRetriever:
             example_question="¿Qué tipos de crímenes hay y cuántos de cada uno?",
         )
 
-    def register_query(
-        self,
-        name: str,
-        description: str,
-        cypher: str,
-        parameters: dict[str, str],
-        example_question: str,
-    ) -> None:
-        """Registra una plantilla Cypher adicional en runtime.
-
-        Args:
-            name: Identificador único de la plantilla.
-            description: Descripción en lenguaje natural de qué hace la query.
-            cypher: Query Cypher con parámetros del tipo $param_name.
-            parameters: Dict {nombre_param: descripción} de los parámetros esperados.
-            example_question: Pregunta de ejemplo que dispara esta plantilla.
-        """
+    def register_query(self, name: str, description: str, cypher: str, parameters: dict[str, str],
+                       example_question: str) -> None:
+        """Registra una plantilla Cypher adicional en runtime."""
         self.queries[name] = {
             "name": name,
             "description": description,
@@ -198,19 +173,8 @@ class ManualRetriever:
             "example_question": example_question,
         }
 
-    # ------------------------------------------------------------------
-    # Introspección
-    # ------------------------------------------------------------------
-
     def get_available_queries(self) -> list[dict[str, Any]]:
-        """Retorna la lista de plantillas disponibles con sus metadatos.
-
-        Útil para que el router sepa qué plantillas existen y pueda
-        incluirlas en su sistema de despacho.
-
-        Returns:
-            Lista de dicts con name, description, parameters y example_question.
-        """
+        """Retorna la lista de plantillas disponibles con sus metadatos."""
         return [
             {
                 "name": q["name"],
@@ -221,28 +185,8 @@ class ManualRetriever:
             for q in self.queries.values()
         ]
 
-    # ------------------------------------------------------------------
-    # Ejecución
-    # ------------------------------------------------------------------
-
-    def retrieve(
-        self,
-        query_name: str,
-        parameters: dict[str, Any] | None = None,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """Ejecuta una plantilla Cypher por nombre con los parámetros proporcionados.
-
-        Args:
-            query_name: Nombre de la plantilla registrada.
-            parameters: Valores para los parámetros de la query ($param).
-
-        Returns:
-            Tupla (cypher_ejecutado, lista_de_resultados). Si la ejecución
-            falla, retorna (cypher, []) y registra el error.
-
-        Raises:
-            ValueError: Si query_name no corresponde a ninguna plantilla registrada.
-        """
+    def retrieve(self, query_name: str, parameters: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
+        """Ejecuta una plantilla Cypher por nombre con los parámetros proporcionados."""
         if query_name not in self.queries:
             available = ", ".join(self.queries.keys())
             raise ValueError(
@@ -264,33 +208,14 @@ class ManualRetriever:
             )
             return cypher, []
 
-    # ------------------------------------------------------------------
-    # Matching heurístico pregunta → plantilla
-    # ------------------------------------------------------------------
-
-    def find_matching_query(
-        self, question: str
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Intenta encontrar la plantilla que mejor encaja con una pregunta.
-
-        Matching heurístico basado en keywords: no usa LLM. Extrae parámetros
-        mediante regex simples (títulos entre comillas, nombres de personajes
-        conocidos, números).
-
-        Args:
-            question: Pregunta en lenguaje natural (español o inglés).
-
-        Returns:
-            Tupla (query_name, parameters) si hay match con confianza suficiente,
-            None en caso contrario.
-        """
+    def find_matching_query(self, question: str) -> tuple[str, dict[str, Any]] | None:
+        """Busca la plantilla que mejor encaja con la pregunta por keywords; extrae parámetros con regex."""
         q = question.lower()
 
         story_title = self._extract_quoted_title(question)
         character_name = self._extract_character_name(q)
         min_stories = self._extract_number(q)
 
-        # Puntuaciones por plantilla: sumar 1 por cada keyword presente
         _TRIGGERS: dict[str, list[str]] = {
             "characters_in_story": [
                 "personajes", "personaje", "characters", "character",
@@ -346,7 +271,6 @@ class ManualRetriever:
         if best_score == 0:
             return None
 
-        # Construir parámetros para la plantilla ganadora
         template_params = self.queries[best_name]["parameters"]
         extracted: dict[str, Any] = {}
 
@@ -357,16 +281,11 @@ class ManualRetriever:
         if "min_stories" in template_params:
             extracted["min_stories"] = min_stories if min_stories is not None else 2
 
-        # Si la plantilla necesita parámetros pero no pudimos extraerlos, no hacer match
         required = set(template_params.keys())
         if required and not required.issubset(extracted.keys()):
             return None
 
         return best_name, extracted
-
-    # ------------------------------------------------------------------
-    # Helpers de extracción de parámetros
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_quoted_title(text: str) -> str | None:

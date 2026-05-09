@@ -161,17 +161,3 @@ Los notebooks en `notebooks/` documentan el uso del sistema de forma interactiva
 | Gemini 2.5 Pro | Text2Cypher, router, agente crítico | Máxima calidad |
 | nomic-embed-text (Ollama) | Embeddings (768 dims) | Local, coste cero |
 | Neo4j 5.x | Grafo de conocimiento | Cypher + índices vectoriales nativos |
-
----
-
-## Costes estimados
-
-| Fase | Coste |
-|------|-------|
-| Hito 2 — Construcción del grafo | ~$2.35 |
-| Hito 3 — Retrievers | ~$1.45 |
-| Hito 4 — Sistema agéntico | ~$3.21 |
-| Total base | ~$7.01 |
-| Con margen ×3 | ~$25-30 |
-
-Se usan créditos gratuitos de Google Cloud (257€ disponibles).

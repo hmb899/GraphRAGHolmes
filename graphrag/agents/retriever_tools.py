@@ -1,5 +1,3 @@
-"""Herramientas de recuperación expuestas al router agéntico."""
-
 import logging
 from typing import Any, Callable, TypedDict
 
@@ -137,26 +135,9 @@ class RetrieverTools:
         return tools
 
     def execute_tool(self, tool_name: str, **kwargs) -> dict[str, Any]:
-        """Ejecuta la herramienta seleccionada y devuelve un dict con estructura uniforme.
+        """Ejecuta la herramienta seleccionada y devuelve un dict uniforme.
 
-        Estructura de retorno:
-            {
-                "tool": str,            # nombre de la herramienta usada
-                "results": list,        # resultados crudos del retriever
-                "context": list[str],   # textos para pasar al LLM como contexto
-                "direct_response": str, # solo para greeting / out_of_scope / skills
-                "cypher": str,          # solo para text2cypher
-            }
-
-        Args:
-            tool_name: Nombre de la herramienta a ejecutar.
-            **kwargs: Parámetros requeridos por la herramienta (p. ej. query=...).
-
-        Returns:
-            Dict con los campos descritos arriba.
-
-        Raises:
-            ValueError: Si tool_name no corresponde a ninguna herramienta registrada.
+        Claves: tool, results, context, direct_response (greeting/scope/skills), cypher (text2cypher).
         """
         if tool_name == "greeting":
             return {

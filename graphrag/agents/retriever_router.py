@@ -1,5 +1,3 @@
-"""Router agéntico que selecciona la herramienta de recuperación más adecuada."""
-
 import logging
 from typing import Any, Literal
 
@@ -45,30 +43,12 @@ class RetrieverRouter:
         self.client = GeminiClient()
         self.settings = get_settings()
 
-    def route(
-        self,
-        question: str,
-        conversation_history: list[dict[str, str]] | None = None,
-    ) -> RouterDecision:
-        """Selecciona la mejor herramienta para responder la pregunta.
-
-        Considera el historial de conversación cuando está disponible para
-        desambiguar referencias anafóricas ("¿Y Watson?", "¿Cuántos hay?").
-
-        Args:
-            question: Pregunta del usuario en lenguaje natural (español o inglés).
-            conversation_history: Turnos anteriores como lista de dicts
-                {role: 'user'|'assistant', content: str}.
-
-        Returns:
-            RouterDecision con tool seleccionado, razonamiento y query optimizada.
-        """
+    def route(self, question: str, conversation_history: list[dict[str, str]] | None = None) -> RouterDecision:
+        """Selecciona la mejor herramienta para responder la pregunta."""
         conversation_history = conversation_history or []
 
         tool_descriptions = self.tools.get_tool_descriptions()
-        tools_str = "\n".join(
-            f"- {t['name']}: {t['description']}" for t in tool_descriptions
-        )
+        tools_str = "\n".join(f"- {t['name']}: {t['description']}" for t in tool_descriptions)
 
         system_prompt = (
             "You are a routing assistant for a knowledge base about Sherlock Holmes "
@@ -113,9 +93,7 @@ class RetrieverRouter:
             "  For vector/hybrid/fulltext: reformulate to maximize retrieval quality.\n"
         )
 
-        # Incrustar el historial en el prompt del usuario para que el LLM tenga contexto
-        # multi-turno. structured_output no soporta lista de mensajes, así que el
-        # historial se serializa como texto plano antes de la pregunta actual.
+        # structured_output no soporta multi-turno, el historial se serializa como texto plano.
         if conversation_history:
             history_lines = "\n".join(
                 f"{msg['role'].upper()}: {msg['content']}"
@@ -136,21 +114,8 @@ class RetrieverRouter:
             temperature=0.0,
         )
 
-    def retrieve(
-        self,
-        question: str,
-        conversation_history: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        """Selecciona la herramienta apropiada y ejecuta la búsqueda.
-
-        Args:
-            question: Pregunta del usuario en lenguaje natural.
-            conversation_history: Turnos anteriores de la conversación.
-
-        Returns:
-            Dict con los resultados del retriever más la clave 'routing_decision'
-            con el RouterDecision que tomó la decisión de enrutamiento.
-        """
+    def retrieve(self, question: str, conversation_history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """Selecciona la herramienta apropiada y ejecuta la búsqueda."""
         decision = self.route(question, conversation_history)
 
         tool_name = decision.tool

@@ -86,8 +86,6 @@ def _is_abstention_answer(text: str) -> bool:
     )
 
 
-# ── Pydantic schemas for schema-constrained LLM outputs ─────────────────────
-
 class _AttributionResult(BaseModel):
     sentences: list[str]
     attributions: list[int]
@@ -138,10 +136,6 @@ class RAGEvaluator:
         self.neo4j = neo4j_manager
         self.client = GeminiClient()
 
-    # ------------------------------------------------------------------
-    # Dataset helpers
-    # ------------------------------------------------------------------
-
     def load_dataset(self, csv_path: str) -> pd.DataFrame:
         """Load benchmark CSV (semicolon-delimited, columns: question, cypher)."""
         return pd.read_csv(csv_path, delimiter=";")
@@ -159,10 +153,6 @@ class RAGEvaluator:
         except Exception:
             return None, []
 
-    # ------------------------------------------------------------------
-    # RAGAS metrics
-    # ------------------------------------------------------------------
-
     def evaluate_context_recall(
         self,
         question: str,
@@ -171,32 +161,12 @@ class RAGEvaluator:
         verbose: bool = False,
     ) -> dict[str, Any]:
         """
-        Robust Context Recall Evaluator
+        Measures whether the retrieved context supports the ground-truth answer.
 
-        Measures whether the retrieved context contains the information necessary
-        to support the ground-truth answer.
-
-        Handles important edge cases:
-        ---------------------------------------------------------
-        1. Empty retrieval + abstention ground truth
-        Example:
-        GT = "This information is not in the knowledge base."
-
-        If no context was retrieved, this is considered CORRECT retrieval behavior
-        and recall = 1.0
-
-        2. Empty retrieval + factual ground truth
-        Recall = 0.0
-
-        3. Semantic matching (not exact wording)
-
-        Returns:
-            {
-                "sentences": [...],
-                "attributions": [0/1...],
-                "reasoning": str,
-                "recall": float
-            }
+        Edge cases:
+        - Empty retrieval + abstention GT → recall = 1.0 (correct behaviour)
+        - Empty retrieval + factual GT    → recall = 0.0
+        - Semantic matching, not exact wording
         """
         _vprint(verbose, "\n── context_recall ──────────────────────────────────")
         _vprint(verbose, f"  Question    : {question}")
@@ -214,9 +184,6 @@ class RAGEvaluator:
         # and so structured graph results (e.g. "{'count(p)': 2}") get question framing.
         context_str = f"[Question: {question}]\n\n" + _truncate_context(retrieved_context)
 
-        # ---------------------------------------------------------
-        # CASE A: Empty retrieval
-        # ---------------------------------------------------------
         if not context_exists:
             _vprint(verbose, "\n  [Step 1] No retrieved context detected.")
 
@@ -256,9 +223,6 @@ class RAGEvaluator:
 
             return result
 
-        # ---------------------------------------------------------
-        # CASE B: Context exists -> normal attribution
-        # ---------------------------------------------------------
         system_prompt = (
             "Goal: Determine whether the ground-truth answer is supported by the retrieved context.\n\n"
             "IMPORTANT — short ground truths: if the ground truth is a single word or short phrase "
@@ -311,9 +275,6 @@ class RAGEvaluator:
         else:
             result["recall"] = 0.0
 
-        # ---------------------------------------------------------
-        # Verbose output
-        # ---------------------------------------------------------
         if verbose:
             sentences = result.get("sentences", [])
 
@@ -337,24 +298,10 @@ class RAGEvaluator:
         verbose: bool = False,
     ) -> dict[str, Any]:
         """
-        Robust faithfulness evaluator.
-
-        Handles two modes automatically:
-
-        1. Retrieval-grounded mode (context exists)
         Measures whether factual claims in the answer are supported by context.
 
-        2. No-context conversational mode
-        Prevents unfair hallucination penalties for greetings, assistant-role
-        statements, generic capability claims, and harmless conversational text.
-
-        Returns:
-            {
-                "statements": [...],
-                "verdicts": [...],     # 1 supported / 0 unsupported
-                "faithfulness": float,
-                "reasoning": [...]
-            }
+        Two modes: retrieval-grounded (context exists) and conversational
+        (no context — greetings/scope refusals are never penalised as hallucinations).
         """
         _vprint(verbose, "\n── faithfulness ────────────────────────────────────")
         _vprint(verbose, f"  Question: {question}")
@@ -369,7 +316,6 @@ class RAGEvaluator:
         context_str = f"[Question: {question}]\n\n" + _truncate_context(context)
         has_context = _has_context(context)
 
-        # Remove inline citations like [1], [2]
         answer_clean = _re.sub(r"\s*\[\d+\]", "", answer).strip()
 
         # "Not in knowledge base" is a meta-statement, not a factual claim.
@@ -384,9 +330,6 @@ class RAGEvaluator:
                 "reasoning": ["KB-abstention responses make no factual claim and are always faithful."],
             }
 
-        # ---------------------------------------------------------
-        # Step 1: Decompose answer into meaningful claims
-        # ---------------------------------------------------------
         decompose_prompt = """
     Goal: Given a question and an answer, break the answer into meaningful factual or semantic statements.
 
@@ -432,9 +375,6 @@ class RAGEvaluator:
                 "reasoning": [],
             }
 
-        # ---------------------------------------------------------
-        # MODE A: No context supplied
-        # ---------------------------------------------------------
         if not has_context:
             _vprint(verbose, "\n  [Step 2] No external context detected.")
             _vprint(verbose, "           Using conversational truthfulness mode...")
@@ -470,9 +410,6 @@ class RAGEvaluator:
             verdicts = verif_obj.verdicts
             reasoning = verif_obj.reasoning
 
-        # ---------------------------------------------------------
-        # MODE B: Context supplied
-        # ---------------------------------------------------------
         else:
             _vprint(verbose, "\n  [Step 2] Context detected.")
             _vprint(verbose, "           Using retrieval-grounded mode...")
@@ -525,18 +462,12 @@ class RAGEvaluator:
             reasoning = reasoning[:min_len]
             statements = statements[:min_len]
 
-        # ---------------------------------------------------------
-        # Score
-        # ---------------------------------------------------------
         faithfulness_score = (
             sum(verdicts) / len(verdicts)
             if verdicts
             else 1.0
         )
 
-        # ---------------------------------------------------------
-        # Verbose output
-        # ---------------------------------------------------------
         if verbose:
             _vprint(verbose, "\n  Verdicts:")
             for s, v, r in zip(statements, verdicts, reasoning):
@@ -562,22 +493,7 @@ class RAGEvaluator:
         ground_truth: str,
         verbose: bool = False,
     ) -> dict[str, Any]:
-        """
-        Goal: Given a ground truth and an answer statement, analyze each statement
-        and classify it into one of the following categories:
-
-        TP (true positive): Statements present in the answer that are also directly
-            supported by one or more statements in the ground truth.
-        FP (false positive): Statements present in the answer but not directly
-            supported by any statement in the ground truth.
-        FN (false negative): Statements found in the ground truth but not present
-            in the answer.
-
-        Each statement can only belong to one of these categories.
-        Provide a reason for each classification.
-
-        verbose=True prints each step so students can follow the reasoning.
-        """
+        """Classifies answer statements as TP/FP/FN against ground truth and computes F1."""
         _vprint(verbose, "\n── answer_correctness ──────────────────────────────")
         _vprint(verbose, f"  Question    : {question}")
         _vprint(verbose, f"  Answer      : {answer}")
@@ -705,18 +621,11 @@ Provide concise reasons.
             "answer_correctness": f1,
         }
 
-    # ------------------------------------------------------------------
-    # Pipeline: run_benchmark → evaluate_results → print_summary
-    # ------------------------------------------------------------------
-
     def run_benchmark(self, dataset: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
-        """
-        Execute the ground-truth Cypher queries, call the agent for each question,
-        and record answers, contexts and latency (mirrors Listing 8.2).
+        """Ejecuta las queries Cypher de ground truth, llama al agente y registra resultados.
 
-        Input DataFrame must have columns: question, cypher
-        Output DataFrame adds:  ground_truth, answer, latency, retrieved_contexts
-        Pass verbose=True to print each question, its ground truth and the agent's answer.
+        Input DataFrame: columnas question, cypher.
+        Output DataFrame: añade ground_truth, answer, latency, retrieved_contexts.
         """
         answers: list = []
         ground_truths: list = []
@@ -728,7 +637,6 @@ Provide concise reasons.
             _vprint(verbose, f"  [{i}/{len(dataset)}] {row['question']}")
             _vprint(verbose, f"{'━'*60}")
 
-            # Execute Cypher to obtain the ground truth dynamically
             _vprint(verbose, f"  [Step 1] Executing Cypher ground truth...")
             _vprint(verbose, f"           {row['cypher']}")
             gt_records = self.neo4j.execute_query(row["cypher"])
@@ -741,7 +649,6 @@ Provide concise reasons.
             ground_truths.append(gt_str)
             _vprint(verbose, f"  Ground truth: {gt_str}")
 
-            # Call the agent
             _vprint(verbose, f"\n  [Step 2] Calling the RAG agent...")
             start = datetime.now()
             try:
@@ -766,13 +673,7 @@ Provide concise reasons.
         return results
 
     def evaluate_results(self, results_df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
-        """
-        Apply the three RAGAS metrics to every row in the results DataFrame
-        and add the scores as new columns (mirrors Listing 8.3 / 8.4).
-
-        Missing answers are replaced with "I don't know" before scoring.
-        Pass verbose=True to print the step-by-step reasoning for every row.
-        """
+        """Aplica las tres métricas RAGAS a cada fila y añade las columnas de score."""
         df = results_df.fillna("I don't know").copy()
 
         recall_scores: list[float] = []
