@@ -94,8 +94,6 @@ sherlock-holmes-graph-rag/
 │   ├── evaluation/        # Evaluación estructurada
 │   └── utils/             # Chunking, embeddings
 ├── notebooks/             # Demos interactivos
-├── tests/
-├── docs/
 ├── data/                  # Textos descargados (gitignored)
 ├── output/                # Resultados intermedios (gitignored)
 └── pyproject.toml
@@ -137,18 +135,8 @@ Los notebooks en `notebooks/` documentan el uso del sistema de forma interactiva
 
 - `01_ingestion_demo.ipynb` — Construir el grafo de conocimiento desde los textos de Gutenberg.
 - `02_retrieval_demo.ipynb` — Probar los tres retrievers de forma aislada y comparada.
-- `03_evaluation_demo.ipynb` — Evaluación estructurada del sistema completo.
-
----
-
-## Hitos
-
-| Hito | Descripción | Fecha |
-|------|-------------|-------|
-| 1 | Selección de dominio y modelado | 9 marzo 2026 |
-| 2 | Construcción del grafo | 13 abril 2026 |
-| 3 | Implementación de retrievers | 27 abril 2026 | 
-| 4 | Orquestación agéntica | 13 mayo 2026 | 
+- `03_evaluation_demo.ipynb` — Evaluación RAGAS del sistema completo.
+- `04_evaluation_v2.ipynb` — Evaluación propia: routing accuracy, consistencia, adversarial y comparativa GraphRAG vs RAG vectorial puro.
 
 ---
 
@@ -156,8 +144,8 @@ Los notebooks en `notebooks/` documentan el uso del sistema de forma interactiva
 
 | Tecnología | Uso | Justificación |
 |------------|-----|---------------|
-| Gemini 2.5 Flash-Lite | Sliding context, entity resolution | Tareas simples, coste mínimo |
-| Gemini 2.5 Flash | Extracción de entidades | Volumen alto, calidad suficiente |
-| Gemini 2.5 Pro | Text2Cypher, router, agente crítico | Máxima calidad |
+| Gemini 2.5 Flash-Lite | Entity resolution (desambiguación LLM en casos ambiguos) | Tareas simples, coste mínimo |
+| Gemini 2.5 Flash | Extracción de entidades y relaciones, generación de respuesta, agente crítico | Volumen alto, calidad suficiente |
+| Gemini 2.5 Pro | Text2Cypher, router | Máxima calidad en decisiones clave |
 | nomic-embed-text (Ollama) | Embeddings (768 dims) | Local, coste cero |
 | Neo4j 5.x | Grafo de conocimiento | Cypher + índices vectoriales nativos |
