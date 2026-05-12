@@ -3,6 +3,7 @@ from typing import Any, Callable, TypedDict
 
 from ..graph.neo4j_manager import Neo4jManager
 from ..retrieval.fulltext_retriever import FullTextRetriever
+from ..retrieval.manual_queries import ManualRetriever
 from ..retrieval.text2cypher import Text2CypherRetriever
 from ..retrieval.vector_retriever import HybridRetriever, VectorRetriever
 
@@ -48,6 +49,7 @@ class RetrieverTools:
         self.hybrid_retriever = HybridRetriever(neo4j_manager)
         self.fulltext_retriever = FullTextRetriever(neo4j_manager)
         self.text2cypher = Text2CypherRetriever(neo4j_manager)
+        self.manual_retriever = ManualRetriever(neo4j_manager)
         self.custom_tools: dict[str, ToolData] = {}
 
     def register_custom_tool(
@@ -120,6 +122,18 @@ class RetrieverTools:
                     "'How many characters appear in Silver Blaze?', "
                     "'What crimes does Holmes investigate?', "
                     "'Which locations are associated with Moriarty?'."
+                ),
+                "parameters": {"query": "The question in natural language"},
+            },
+            {
+                "name": "manual_search",
+                "description": (
+                    "Execute a pre-defined Cypher template for common structural "
+                    "queries about the Holmes canon. More reliable than text2cypher "
+                    "for the patterns it covers: characters in a story, stories of a "
+                    "character, recurring characters, crimes investigated, locations, "
+                    "deduction chains, objects used, story summaries, crimes by type. "
+                    "Use when the question clearly matches one of those patterns."
                 ),
                 "parameters": {"query": "The question in natural language"},
             },
@@ -211,6 +225,30 @@ class RetrieverTools:
             ]
             return {
                 "tool": tool_name,
+                "cypher": cypher,
+                "results": results,
+                "context": context,
+            }
+
+        if tool_name == "manual_search":
+            query = kwargs.get("query", "")
+            match = self.manual_retriever.find_matching_query(query)
+            if match is None:
+                logger.warning("manual_search: no template matched for query: %s", query)
+                return {"tool": tool_name, "results": [], "context": []}
+            query_name, params = match
+            try:
+                cypher, results = self.manual_retriever.retrieve(query_name, params)
+            except Exception as exc:
+                logger.error("Error en manual_search (%s): %s", query_name, exc)
+                cypher, results = "", []
+            context = [
+                "; ".join(f"{k}: {v}" for k, v in r.items()) if isinstance(r, dict) else str(r)
+                for r in results
+            ]
+            return {
+                "tool": tool_name,
+                "query_name": query_name,
                 "cypher": cypher,
                 "results": results,
                 "context": context,
