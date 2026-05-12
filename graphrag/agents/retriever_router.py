@@ -18,6 +18,7 @@ class RouterDecision(BaseModel):
         "fulltext_search",
         "hybrid_search",
         "text2cypher",
+        "manual_search",
         "greeting",
         "out_of_scope",
         "skills",
@@ -63,7 +64,14 @@ class RetrieverRouter:
             "3. out_of_scope — Use when the question is clearly unrelated to Sherlock Holmes stories:\n"
             "   weather, sports, cooking, politics, current events, other fictional universes.\n"
             "   Examples: \"What is the capital of France?\", \"¿Quién ganó el Mundial?\".\n\n"
-            "4. text2cypher   — Use for STRUCTURED data queries that need graph traversal:\n"
+            "4. manual_search — Use for STRUCTURED queries that match one of these known patterns:\n"
+            "   characters in a story, stories of a character, recurring characters,\n"
+            "   crimes investigated by a character, relationships between characters in a story,\n"
+            "   locations in a story, deduction chain in a story, objects used by a character,\n"
+            "   story summary (counts of characters/crimes/scenes/deductions), crimes by type.\n"
+            "   Prefer this over text2cypher when the question clearly matches one of those patterns.\n\n"
+            "5. text2cypher   — Use for STRUCTURED data queries that need graph traversal\n"
+            "   and do NOT match any manual_search pattern:\n"
             "   - Counts: \"¿Cuántos personajes aparecen en...?\", \"How many crimes...\"\n"
             "   - Enumerations: \"Lista todos los...\", \"List all characters who...\"\n"
             "   - Specific attributes: \"¿Cuál es la ocupación de...?\"\n"
@@ -73,13 +81,13 @@ class RetrieverRouter:
             "   - Aggregations: \"¿Cuántos relatos hay por colección?\"\n"
             "   - Comparisons: \"¿Qué personajes aparecen en más de un relato?\"\n"
             "   - Deduction chains and reasoning sequences: \"What deduction chain does Holmes build in X?\", \"What is the reasoning chain in X?\", \"¿Cuál es la cadena de deducciones en X?\" (uses LEADS_TO relationship between Deduction nodes — NOT answerable from text chunks)\n\n"
-            "5. vector_search — Use for DESCRIPTIVE or CONCEPTUAL questions answerable from text passages:\n"
+            "6. vector_search — Use for DESCRIPTIVE or CONCEPTUAL questions answerable from text passages:\n"
             "   \"¿Cómo resuelve Holmes el caso?\", \"Describe the relationship between Holmes and Watson\",\n"
             "   \"¿Qué método usa Holmes para...?\", \"Explain Holmes' deduction about...\".\n\n"
-            "6. fulltext_search — Use when the user wants to find EXACT mentions or specific terms:\n"
+            "7. fulltext_search — Use when the user wants to find EXACT mentions or specific terms:\n"
             "   \"¿Dónde se menciona 'strychnine'?\", \"Find passages about 'the red-headed league'\",\n"
             "   quoted search terms, proper nouns the user wants to locate verbatim in the text.\n\n"
-            "7. hybrid_search — Use when BOTH semantic meaning AND specific keywords matter:\n"
+            "8. hybrid_search — Use when BOTH semantic meaning AND specific keywords matter:\n"
             "   \"Holmes' analysis of the speckled band\", \"Watson's description of Irene Adler\".\n"
             "   Also use as a FALLBACK when unsure between vector_search and fulltext_search.\n\n"
             "IMPORTANT:\n"
